@@ -8,28 +8,44 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const PORT = process.env.PORT || 3000;
-const MAX_CLIENTS = 500;        // একসঙ্গে সর্বোচ্চ অনলাইন ইউজার
-const MAX_PER_IP = 20;          // এক IP থেকে সর্বোচ্চ সংযোগ
-const MAX_SIGNALS_PER_MIN = 600; // এক ইউজারের মিনিটে সর্বোচ্চ সিগন্যাল
+const PORT = Number(process.env.PORT) || 3000;
+const MAX_CLIENTS = 500;          // একসঙ্গে সর্বোচ্চ অনলাইন ইউজার
+const MAX_PER_IP = 20;            // এক IP থেকে সর্বোচ্চ সংযোগ
+const MAX_SIGNALS_PER_MIN = 600;  // এক ইউজারের মিনিটে সর্বোচ্চ সিগন্যাল
+const MAX_BODY_BYTES = 120 * 1024;
+const RECONNECT_GRACE_MS = 2500;  // সাময়িক ডিসকানেক্টে ইউজার লিস্ট স্থিতিশীল রাখা
 const TYPES = new Set(['offer', 'answer', 'ice', 'hangup', 'reject', 'busy']);
 
-// ইউজারনেম -> { res, token, ip, count }
+// ইউজারনেম -> { res, token, ip, count, hb, dropTimer }
 const clients = new Map();
 const ipCount = new Map();
 
-const cleanName = (s) => String(s || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 24);
+const cleanName = (s) =>
+  String(s || '')
+    .replace(/[\u0000-\u001f<>]/g, '')
+    .trim()
+    .slice(0, 24);
 
 function iceConfig() {
-  const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+  const iceServers = [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  ];
   if (process.env.TURN_URL) {
-    iceServers.push({
-      urls: process.env.TURN_URL.split(',').map((s) => s.trim()).filter(Boolean),
-      username: process.env.TURN_USER || '',
-      credential: process.env.TURN_PASS || '',
-    });
+    const urls = process.env.TURN_URL.split(',').map((s) => s.trim()).filter(Boolean);
+    if (urls.length) {
+      iceServers.push({
+        urls,
+        username: process.env.TURN_USER || '',
+        credential: process.env.TURN_PASS || '',
+      });
+    }
   }
-  return { iceServers };
+  return {
+    iceServers,
+    iceCandidatePoolSize: 8,
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
+  };
 }
 
 const MANIFEST = JSON.stringify({
@@ -47,7 +63,12 @@ const MANIFEST = JSON.stringify({
 
 const ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#0f766e"/><path d="M22 18c-2 0-4 2-4 5 0 13 14 27 27 27 3 0 5-2 5-4l-1-5-8-3-4 4c-4-2-8-6-10-10l4-4-3-8z" fill="#fff"/></svg>`;
 
-const PAGES = { '/': 'index.html', '/index.html': 'index.html', '/app': 'app.html', '/app.html': 'app.html' };
+const PAGES = {
+  '/': 'index.html',
+  '/index.html': 'index.html',
+  '/app': 'app.html',
+  '/app.html': 'app.html',
+};
 
 const CSP = [
   "default-src 'self'",
@@ -63,16 +84,26 @@ const CSP = [
 ].join('; ');
 
 function safeWrite(res, text) {
-  try { res.write(text); } catch { /* সংযোগ আগেই বন্ধ */ }
+  if (!res || res.writableEnded || res.destroyed) return false;
+  try {
+    const ok = res.write(text);
+    if (typeof res.flush === 'function') res.flush();
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 function send(res, event, data) {
-  safeWrite(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  return safeWrite(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 function broadcastUsers() {
   const list = [...clients.keys()];
-  for (const c of clients.values()) send(c.res, 'users', list);
+  const payload = `event: users\ndata: ${JSON.stringify(list)}\n\n`;
+  for (const c of clients.values()) {
+    safeWrite(c.res, payload);
+  }
 }
 
 function clientIp(req) {
@@ -81,16 +112,41 @@ function clientIp(req) {
   return req.socket.remoteAddress || 'unknown';
 }
 
-function dropClient(user, c) {
+function releaseClientEntry(user, c, notify = true) {
+  if (c.hb) {
+    clearInterval(c.hb);
+    c.hb = null;
+  }
+  if (c.dropTimer) {
+    clearTimeout(c.dropTimer);
+    c.dropTimer = null;
+  }
+  if (clients.get(user) === c) {
+    clients.delete(user);
+    const n = (ipCount.get(c.ip) || 1) - 1;
+    if (n <= 0) ipCount.delete(c.ip);
+    else ipCount.set(c.ip, n);
+    if (notify) broadcastUsers();
+  }
+}
+
+function scheduleDropClient(user, c) {
   if (clients.get(user) !== c) return;
-  clients.delete(user);
-  const n = (ipCount.get(c.ip) || 1) - 1;
-  if (n <= 0) ipCount.delete(c.ip); else ipCount.set(c.ip, n);
-  broadcastUsers();
+  if (c.hb) {
+    clearInterval(c.hb);
+    c.hb = null;
+  }
+  if (c.dropTimer) clearTimeout(c.dropTimer);
+  c.dropTimer = setTimeout(() => {
+    releaseClientEntry(user, c, true);
+  }, RECONNECT_GRACE_MS);
+  c.dropTimer.unref?.();
 }
 
 // প্রতি মিনিটে সিগন্যাল গণনা শূন্য করি
-setInterval(() => { for (const c of clients.values()) c.count = 0; }, 60000).unref();
+setInterval(() => {
+  for (const c of clients.values()) c.count = 0;
+}, 60000).unref();
 
 const server = http.createServer((req, res) => {
   res.on('error', () => {});
@@ -100,92 +156,184 @@ const server = http.createServer((req, res) => {
   if (req.headers['x-forwarded-proto'] === 'https') {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000');
   }
+
   let url;
-  try { url = new URL(req.url, 'http://localhost'); }
-  catch { res.writeHead(400); return res.end(); }
+  try {
+    url = new URL(req.url, 'http://localhost');
+  } catch {
+    res.writeHead(400);
+    return res.end();
+  }
 
   // ক্লায়েন্ট সংযোগ (Server-Sent Events)
   if (req.method === 'GET' && url.pathname === '/events') {
     const user = cleanName(url.searchParams.get('user'));
-    if (!user) { res.writeHead(400); return res.end('name required'); }
-    if (clients.has(user)) { res.writeHead(409); return res.end('name taken'); }
-    if (clients.size >= MAX_CLIENTS) { res.writeHead(503); return res.end('server full'); }
+    if (!user) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('name required');
+    }
+
+    const existing = clients.get(user);
+    if (existing) {
+      // আগের সংযোগটি গ্রেস পিরিয়ডে থাকলে বা মৃত হলে পরিষ্কার করে নতুন সংযোগ নিই
+      if (existing.dropTimer || existing.res.writableEnded || existing.res.destroyed) {
+        releaseClientEntry(user, existing, false);
+      } else {
+        res.writeHead(409, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('name taken');
+      }
+    }
+
+    if (clients.size >= MAX_CLIENTS) {
+      res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('server full');
+    }
+
     const ip = clientIp(req);
-    if ((ipCount.get(ip) || 0) >= MAX_PER_IP) { res.writeHead(429); return res.end('too many connections'); }
+    if ((ipCount.get(ip) || 0) >= MAX_PER_IP) {
+      res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('too many connections');
+    }
 
     res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
+      'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    const c = { res, token: crypto.randomBytes(16).toString('hex'), ip, count: 0 };
+
+    const token = crypto.randomBytes(16).toString('hex');
+    const c = { res, token, ip, count: 0, hb: null, dropTimer: null };
     clients.set(user, c);
     ipCount.set(ip, (ipCount.get(ip) || 0) + 1);
-    send(res, 'hello', { user, token: c.token });
+
+    send(res, 'hello', { user, token });
     broadcastUsers();
-    const hb = setInterval(() => safeWrite(res, ':hb\n\n'), 15000);
-    req.on('close', () => { clearInterval(hb); dropClient(user, c); });
+
+    c.hb = setInterval(() => {
+      if (!safeWrite(res, ':hb\n\n')) {
+        scheduleDropClient(user, c);
+      }
+    }, 12000);
+    c.hb.unref?.();
+
+    req.on('close', () => scheduleDropClient(user, c));
     return;
   }
 
   // সিগন্যাল পাঠানো (offer / answer / ice / hangup / reject / busy)
   if (req.method === 'POST' && url.pathname === '/signal') {
-    let body = '';
+    const chunks = [];
+    let totalBytes = 0;
     let tooBig = false;
+
     req.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 100000) { tooBig = true; req.destroy(); }
-    });
-    req.on('end', () => {
       if (tooBig) return;
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_BODY_BYTES) {
+        tooBig = true;
+        res.writeHead(413, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('payload too large');
+        req.destroy();
+        return;
+      }
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+
+    req.on('end', () => {
+      if (tooBig || res.writableEnded) return;
       try {
-        const { from, to, type, data, token } = JSON.parse(body);
-        if (typeof from !== 'string' || typeof to !== 'string') { res.writeHead(400); return res.end('bad request'); }
-        if (!TYPES.has(type)) { res.writeHead(400); return res.end('bad type'); }
-        const sender = clients.get(from);
-        // টোকেন না মিললে অন্য কারও নামে সিগন্যাল পাঠানো যাবে না
-        if (!sender || typeof token !== 'string' || token.length !== sender.token.length ||
-            !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(sender.token))) {
-          res.writeHead(403); return res.end('forbidden');
+        const raw = Buffer.concat(chunks).toString('utf8');
+        const parsed = JSON.parse(raw);
+        const { from, to, type, data, token } = parsed || {};
+
+        if (typeof from !== 'string' || typeof to !== 'string' || !TYPES.has(type)) {
+          res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('bad request');
         }
-        if (++sender.count > MAX_SIGNALS_PER_MIN) { res.writeHead(429); return res.end('slow down'); }
+
+        const sender = clients.get(from);
+        if (
+          !sender ||
+          typeof token !== 'string' ||
+          token.length !== sender.token.length ||
+          !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(sender.token))
+        ) {
+          res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('forbidden');
+        }
+
+        if (++sender.count > MAX_SIGNALS_PER_MIN) {
+          res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('slow down');
+        }
+
         const target = clients.get(to);
-        if (!target || to === from) { res.writeHead(404); return res.end('offline'); }
-        send(target.res, 'signal', { from, type, data });
-        res.writeHead(200); res.end('ok');
+        if (!target || to === from) {
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('offline');
+        }
+
+        const ok = send(target.res, 'signal', { from, type, data });
+        if (!ok) {
+          scheduleDropClient(to, target);
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('offline');
+        }
+
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('ok');
       } catch {
-        res.writeHead(400); res.end('bad request');
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('bad request');
       }
     });
+
     req.on('error', () => {});
     return;
   }
 
   if (req.method === 'GET' && url.pathname === '/config') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
     return res.end(JSON.stringify(iceConfig()));
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
     return res.end(JSON.stringify({ ok: true, online: clients.size }));
   }
 
   if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
-    res.writeHead(200, { 'Content-Type': 'application/manifest+json' });
+    res.writeHead(200, {
+      'Content-Type': 'application/manifest+json; charset=utf-8',
+      'Cache-Control': 'no-cache',
+    });
     return res.end(MANIFEST);
   }
 
   if (req.method === 'GET' && url.pathname === '/icon.svg') {
-    res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' });
+    res.writeHead(200, {
+      'Content-Type': 'image/svg+xml',
+      'Cache-Control': 'public, max-age=86400',
+    });
     return res.end(ICON);
   }
 
   // পেজ: / = ল্যান্ডিং, /app = কলিং অ্যাপ
   if ((req.method === 'GET' || req.method === 'HEAD') && PAGES[url.pathname]) {
-    fs.readFile(path.join(__dirname, PAGES[url.pathname]), (err, buf) => {
-      if (err) { res.writeHead(500); return res.end('page not found'); }
+    const filePath = path.join(__dirname, PAGES[url.pathname]);
+    fs.readFile(filePath, (err, buf) => {
+      if (res.writableEnded) return;
+      if (err) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('page not found');
+      }
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-cache',
@@ -212,7 +360,13 @@ process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e))
 
 // নতুন ভার্সন ডিপ্লয়ের সময় ভদ্রভাবে বন্ধ হই (ক্লায়েন্ট নিজে আবার সংযুক্ত হবে)
 function shutdown() {
-  for (const c of clients.values()) { try { c.res.end(); } catch {} }
+  for (const [user, c] of clients.entries()) {
+    if (c.hb) clearInterval(c.hb);
+    if (c.dropTimer) clearTimeout(c.dropTimer);
+    try { c.res.end(); } catch {}
+    clients.delete(user);
+  }
+  ipCount.clear();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
 }
