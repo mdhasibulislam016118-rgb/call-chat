@@ -84,19 +84,19 @@ header small{opacity:.8}
   <div id="chat"><div id="msgs"></div>
     <form id="cf" onsubmit="sendChat(event)"><input id="ci" placeholder="মেসেজ লিখুন…" autocomplete="off"><button>পাঠান</button></form></div>
   <div class="ctrls">
-    <button class="cb" id="bMute" onclick="toggleMic()">🎤</button>
-    <button class="cb" id="bCam" onclick="toggleCam()">📷</button>
-    <button class="cb" id="bFlip" onclick="flipCam()">🔄</button>
-    <button class="cb" onclick="toggleChat()">💬</button>
-    <button class="cb end" onclick="endCall()">📵</button>
+    <button class="cb" id="bMute" aria-label="মাইক চালু/বন্ধ" onclick="toggleMic()">🎤</button>
+    <button class="cb" id="bCam" aria-label="ক্যামেরা চালু/বন্ধ" onclick="toggleCam()">📷</button>
+    <button class="cb" id="bFlip" aria-label="ক্যামেরা বদল" onclick="flipCam()">🔄</button>
+    <button class="cb" aria-label="চ্যাট" onclick="toggleChat()">💬</button>
+    <button class="cb end" aria-label="কল শেষ করুন" onclick="endCall()">📵</button>
   </div>
 </section>
 
 <div id="incoming">
   <div><div class="av" id="iav"></div><h2 id="iname" style="font-size:26px"></h2><p id="itype" style="color:#cfd8dc;margin-top:6px"></p></div>
   <div class="row">
-    <button class="cb end" style="width:70px;height:70px" onclick="rejectCall()">📵</button>
-    <button class="cb acc" style="width:70px;height:70px" onclick="acceptCall()">📞</button>
+    <button class="cb end" style="width:70px;height:70px" aria-label="প্রত্যাখ্যান" onclick="rejectCall()">📵</button>
+    <button class="cb acc" style="width:70px;height:70px" aria-label="কল ধরুন" onclick="acceptCall()">📞</button>
   </div>
 </div>
 
@@ -109,7 +109,8 @@ fetch('/config').then(r => r.json()).then(c => { if (c && c.iceServers) ICE = c;
 let me = null, es = null, pc = null, dc = null, localStream = null;
 let peer = null, incoming = null, pendingIce = [], withVideo = false, timer = null, startedAt = 0;
 let onlineUsers = [];
-let outIce = null;          // কলার: offer পাঠানোর আগের ICE candidate জমা রাখে
+let remoteStream = null, token = null, wakeLock = null;
+let outIce = null;        // কলার: offer পাঠানোর আগের ICE candidate জমা রাখে
 let ringTimeout = null, discTimer = null, retryTimer = null, facing = 'user', wantOnline = false;
 
 function show(id){ document.querySelectorAll('.screen').forEach(s => s.classList.toggle('on', s.id === id)); }
@@ -133,8 +134,9 @@ function connect(name, isRetry){
   wantOnline = true;
   es = new EventSource('/events?user=' + encodeURIComponent(name));
   let ok = false;
-  es.addEventListener('hello', () => {
+  es.addEventListener('hello', e => {
     ok = true; me = name;
+    try { token = JSON.parse(e.data).token; } catch { token = null; }
     $('#me').textContent = name; $('#st').textContent = '● অনলাইন';
     if (!$('#call').classList.contains('on')) show('home');
   });
@@ -156,8 +158,9 @@ function connect(name, isRetry){
 
 // কল চলাকালীন অন্য পক্ষ অফলাইন হলে কল শেষ করি
 function checkPeerPresent(){
-  if (peer && pc && !onlineUsers.includes(peer)) cleanup('ইউজার অফলাইন হয়ে গেছে');
-  else if (incoming && !onlineUsers.includes(incoming.from)) cleanup('মিসড কল');
+  if (incoming && !onlineUsers.includes(incoming.from)) cleanup('মিসড কল');
+  // সংযুক্ত কল সরাসরি দুই ডিভাইসের মধ্যে চলে। সার্ভার রিস্টার্ট হলে তালিকা সাময়িক খালি দেখাতে পারে, তাই চলমান কল কাটি না
+  else if (peer && pc && pc.connectionState !== 'connected' && !onlineUsers.includes(peer)) cleanup('ইউজার অফলাইন হয়ে গেছে');
 }
 
 function renderUsers(){
@@ -182,10 +185,29 @@ function renderUsers(){
   });
 }
 
-function sig(to, type, data){
-  return fetch('/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: me, to, type, data }) }).catch(() => {});
+// সিগন্যাল পাঠাই; নেটওয়ার্ক ত্রুটি হলে দুবার আবার চেষ্টা করি। সফল না হলে null ফেরত দেয়।
+async function sig(to, type, data){
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await fetch('/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: me, token, to, type, data }) });
+    } catch { await new Promise(r => setTimeout(r, 400 * (i + 1))); }
+  }
+  return null;
 }
+
+// সংযোগ ছিন্ন থাকলে (ব্যাকগ্রাউন্ড/নেট ফিরে এলে) আবার সংযুক্ত হই
+function ensureConnected(){
+  if (wantOnline && me && (!es || es.readyState === 2)) connect(me, true);
+}
+window.addEventListener('online', ensureConnected);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { ensureConnected(); if (pc) keepAwake(); } });
+
+// কল চলার সময় স্ক্রিন জাগিয়ে রাখি (না হলে ফোনের স্ক্রিন বন্ধ হলে কল কেটে যেতে পারে)
+async function keepAwake(){
+  try { if ('wakeLock' in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } } catch {}
+}
+function releaseAwake(){ try { if (wakeLock) wakeLock.release(); } catch {} wakeLock = null; }
 
 /* ---------- রিংটোন ---------- */
 let actx = null, ringT = null;
@@ -213,23 +235,43 @@ function mediaError(e, video){
   return 'মাইক্রোফোন' + (video ? '/ক্যামেরা' : '') + ' ব্যবহারের অনুমতি দিন।';
 }
 
+// মাইক/ক্যামেরা চালু হলে সংশ্লিষ্ট sender-এ বসাই (নতুন করে দর-কষাকষি লাগে না)
+function attachMedia(stream, myPc){
+  if (pc !== myPc) { stream.getTracks().forEach(t => t.stop()); return; }
+  localStream = stream;
+  for (const t of stream.getTracks()) {
+    const tr = pc.getTransceivers().find(x => x.receiver.track && x.receiver.track.kind === t.kind && !x.sender.track);
+    if (tr) tr.sender.replaceTrack(t); else pc.addTrack(t, stream);
+  }
+  $('#local').srcObject = stream;
+}
+function mediaFailed(e, myPc, video){
+  if (pc !== myPc) return;
+  if (peer) sig(peer, 'hangup');
+  cleanup('');
+  alert(mediaError(e, video));
+}
+
 async function startCall(to, video){
   if (pc || incoming) return;
   initAudio();
-  try { localStream = await getMedia(video); }
-  catch (e) { alert(mediaError(e, video)); return; }
-  peer = to; withVideo = video;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert(mediaError(new Error('insecure'), video)); return; }
+  peer = to; withVideo = video; localStream = null;
   openCallUI('রিং হচ্ছে…');
   ring('out');
   outIce = [];
   setupPC();
+  const myPc = pc;
+  pc.addTransceiver('audio', { direction: 'sendrecv' });
+  if (video) pc.addTransceiver('video', { direction: 'sendrecv' });
   dc = pc.createDataChannel('chat'); setupDC();
+  // মাইক/ক্যামেরা চালুর অপেক্ষা না করেই কল পাঠাই, যাতে অন্যজনের ফোনে দ্রুত রিং হয়
+  getMedia(video).then(s => attachMedia(s, myPc)).catch(e => mediaFailed(e, myPc, video));
   try {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    const r = await fetch('/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: me, to, type: 'offer', data: { sdp: pc.localDescription, video } }) });
-    if (!r.ok) throw new Error('offline');
+    const r = await sig(to, 'offer', { sdp: pc.localDescription, video });
+    if (!r || !r.ok) throw new Error('offline');
   } catch { return cleanup('ইউজার এখন অনলাইনে নেই'); }
   // offer পৌঁছানোর পরই ICE candidate পাঠাই, যাতে ক্রম ঠিক থাকে
   const q = outIce; outIce = null;
@@ -239,19 +281,21 @@ async function startCall(to, video){
 }
 
 function setupPC(){
-  pc = new RTCPeerConnection(ICE);
-  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc = new RTCPeerConnection({ ...ICE, iceCandidatePoolSize: 4 }); // ICE আগে থেকেই জোগাড় শুরু
+  remoteStream = new MediaStream();
+  $('#remote').srcObject = remoteStream;
   pc.onicecandidate = e => {
     if (!e.candidate) return;
     if (outIce) outIce.push(e.candidate); else sig(peer, 'ice', e.candidate);
   };
-  pc.ontrack = e => { $('#remote').srcObject = e.streams[0]; };
+  pc.ontrack = e => { remoteStream.addTrack(e.track); $('#remote').play().catch(() => {}); };
   pc.ondatachannel = e => { dc = e.channel; setupDC(); };
   pc.onconnectionstatechange = () => {
     const s = pc && pc.connectionState;
     clearTimeout(discTimer);
     if (s === 'connected') {
-      clearTimeout(ringTimeout); stopRing(); startTimer();
+      clearTimeout(ringTimeout); stopRing(); startTimer(); keepAwake();
+      $('#remote').play().catch(() => {});
       if (withVideo) $('#info').style.display = 'none';
     }
     // নেটওয়ার্ক সাময়িক গেলে ১০ সেকেন্ড অপেক্ষা, তারপর কল শেষ
@@ -292,7 +336,11 @@ async function onSignal({ from, type, data }){
   if (type === 'offer') {
     if (pc || incoming) return sig(from, 'busy');
     incoming = { from, data };
-    pendingIce = [];
+    pendingIce = []; peer = from; withVideo = !!data.video; localStream = null;
+    // রিং বাজার সময়েই সংযোগ প্রস্তুত করি, যাতে ধরার পর দ্রুত সংযুক্ত হয়
+    setupPC();
+    incoming.ready = pc.setRemoteDescription(data.sdp).then(flushIce);
+    incoming.ready.catch(() => {});
     $('#iav').textContent = initial(from);
     $('#iname').textContent = from;
     $('#itype').textContent = data.video ? 'ভিডিও কল আসছে…' : 'ভয়েস কল আসছে…';
@@ -325,28 +373,30 @@ async function flushIce(){
 /* ---------- রিসিভার ---------- */
 async function acceptCall(){
   if (!incoming) return;
-  const { from, data } = incoming;
+  const { from, ready } = incoming;
+  const myPc = pc;
+  const video = withVideo;
   stopRing();
-  try { localStream = await getMedia(data.video); }
-  catch (e) { alert(mediaError(e, data.video)); return rejectCall(); }
-  if (!incoming) { localStream.getTracks().forEach(t => t.stop()); localStream = null; return; } // ইতিমধ্যে কেটে গেছে
-  incoming = null; peer = from; withVideo = data.video;
+  incoming = null;
   $('#incoming').classList.remove('on');
   openCallUI('সংযুক্ত হচ্ছে…');
-  setupPC();
+  // মাইক/ক্যামেরা চালু আর উত্তর তৈরি একসঙ্গে চলে
+  getMedia(video).then(s => attachMedia(s, myPc)).catch(e => mediaFailed(e, myPc, video));
+  // ধরার পর ৩০ সেকেন্ডে সংযোগ না হলে ছেড়ে দিই, যেন আটকে না থাকে
+  ringTimeout = setTimeout(() => { if (pc === myPc && pc.connectionState !== 'connected') { sig(from, 'hangup'); cleanup('সংযোগ হয়নি, আবার চেষ্টা করুন'); } }, 30000);
   try {
-    await pc.setRemoteDescription(data.sdp);
-    await flushIce();
+    await ready;
+    if (pc !== myPc) return; // ইতিমধ্যে কেটে গেছে
+    pc.getTransceivers().forEach(t => { if (t.receiver.track) t.direction = 'sendrecv'; });
     const ans = await pc.createAnswer();
     await pc.setLocalDescription(ans);
     await sig(from, 'answer', pc.localDescription);
-  } catch { sig(from, 'hangup'); cleanup('কল সংযুক্ত করা যায়নি'); }
+  } catch { if (pc === myPc) { sig(from, 'hangup'); cleanup('কল সংযুক্ত করা যায়নি'); } }
 }
 
 function rejectCall(){
   if (incoming) sig(incoming.from, 'reject');
-  incoming = null; pendingIce = [];
-  stopRing(); $('#incoming').classList.remove('on');
+  cleanup('');
 }
 
 function endCall(){
@@ -355,75 +405,13 @@ function endCall(){
 }
 
 function cleanup(msg){
-  stopRing(); clearInterval(timer); clearTimeout(ringTimeout); clearTimeout(discTimer);
+  stopRing(); clearInterval(timer); clearTimeout(ringTimeout); clearTimeout(discTimer); releaseAwake();
   outIce = null; facing = 'user';
   if (dc) { try { dc.close(); } catch {} }
   if (pc) { pc.onconnectionstatechange = null; pc.close(); }
   if (localStream) localStream.getTracks().forEach(t => t.stop());
-  pc = dc = localStream = peer = incoming = null; pendingIce = [];
+  pc = dc = localStream = peer = incoming = remoteStream = null; pendingIce = [];
   $('#remote').srcObject = null; $('#local').srcObject = null;
   $('#incoming').classList.remove('on');
   show('home');
-  if (msg) { $('#st').textContent = msg; setTimeout(() => { $('#st').textContent = '● অনলাইন'; }, 3500); }
-}
-
-/* ---------- কন্ট্রোল ---------- */
-function toggleMic(){
-  if (!localStream) return;
-  const t = localStream.getAudioTracks()[0]; if (!t) return;
-  t.enabled = !t.enabled;
-  $('#bMute').classList.toggle('off', !t.enabled);
-  $('#bMute').textContent = t.enabled ? '🎤' : '🔇';
-}
-function toggleCam(){
-  if (!localStream) return;
-  const t = localStream.getVideoTracks()[0]; if (!t) return;
-  t.enabled = !t.enabled;
-  $('#bCam').classList.toggle('off', !t.enabled);
-}
-function toggleChat(){ $('#chat').classList.toggle('on'); }
-
-// সামনের/পেছনের ক্যামেরা বদল
-async function flipCam(){
-  if (!pc || !localStream || !withVideo) return;
-  const next = facing === 'user' ? 'environment' : 'user';
-  try {
-    const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: next } });
-    const nt = s.getVideoTracks()[0];
-    const sender = pc.getSenders().find(x => x.track && x.track.kind === 'video');
-    if (sender) await sender.replaceTrack(nt);
-    localStream.getVideoTracks().forEach(t => { localStream.removeTrack(t); t.stop(); });
-    localStream.addTrack(nt);
-    $('#local').srcObject = localStream;
-    $('#local').style.transform = next === 'user' ? 'scaleX(-1)' : 'none';
-    facing = next;
-    $('#bCam').classList.remove('off');
-  } catch { /* ডিভাইসে একটিই ক্যামেরা থাকলে কিছু হবে না */ }
-}
-
-// ট্যাব বন্ধ করলে অন্য পক্ষকে জানাই
-window.addEventListener('pagehide', () => {
-  if (peer && me) navigator.sendBeacon('/signal', new Blob([JSON.stringify({ from: me, to: peer, type: 'hangup' })], { type: 'application/json' }));
-});
-
-/* ---------- কলের ভেতরে চ্যাট ---------- */
-function setupDC(){
-  dc.onmessage = e => addMsg(e.data, false);
-}
-function addMsg(text, mine){
-  const d = document.createElement('div');
-  d.className = 'm' + (mine ? ' me' : '');
-  d.textContent = text;
-  $('#msgs').appendChild(d);
-  $('#msgs').scrollTop = 1e9;
-}
-function sendChat(e){
-  e.preventDefault();
-  const t = $('#ci').value.trim();
-  if (!t || !dc || dc.readyState !== 'open') return;
-  dc.send(t); addMsg(t, true); $('#ci').value = '';
-}
-
-</script>
-</body>
-</html>
+  if (msg) { $('#st').textContent = msg; setTimeout(() => { $('#st').textContent = '● 
