@@ -1,0 +1,14 @@
+{
+  "name": "call-chat",
+  "version": "1.0.0",
+  "description": "ব্রাউজার ভিত্তিক ভয়েস ও ভিডিও কল (WebRTC)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "private": true
+}

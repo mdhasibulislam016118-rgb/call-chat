@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: call-chat
+    runtime: node
+    plan: free
+    buildCommand: "echo no build step"
+    startCommand: "node server.js"
+    healthCheckPath: /health
+    envVars:
+      # দূরের নেটওয়ার্কে কল ভালো চালাতে চাইলে TURN সার্ভারের তথ্য দিন (ঐচ্ছিক)
+      - key: TURN_URL
+        sync: false
+      - key: TURN_USER
+        sync: false
+      - key: TURN_PASS
+        sync: false

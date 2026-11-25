@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>কল চ্যাট — ব্রাউজারেই ভয়েস ও ভিডিও কল</title>
+<meta name="description" content="অ্যাপ ইনস্টল ছাড়াই ব্রাউজারে ভয়েস ও ভিডিও কল। শুধু একটি নাম দিন আর কল করুন।">
+<meta name="theme-color" content="#0f766e">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --bg:#f5f8f6; --surface:#ffffff; --ink:#10201c; --mut:#52645e; --line:#dbe5e0;
+  --accent:#0f766e; --accent-ink:#ffffff; --soft:#e3f1ec; --warn:#b45309;
+  --font:"Hind Siliguri","Noto Sans Bengali",system-ui,-apple-system,"Segoe UI",sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0b1512; --surface:#13221e; --ink:#e8f1ed; --mut:#9bb0a8; --line:#23372f;
+  --accent:#34d399; --accent-ink:#04261b; --soft:#143028; --warn:#f59e0b;
+}}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--font);background:var(--bg);color:var(--ink);line-height:1.65;font-size:17px}
+.wrap{width:100%;max-width:1040px;margin:0 auto;padding-inline:max(18px,env(safe-area-inset-left,0px)) max(18px,env(safe-area-inset-right,0px))}
+a{color:inherit}
+header.top{display:flex;align-items:center;justify-content:space-between;padding-block:18px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:20px;text-decoration:none}
+.brand svg{width:34px;height:34px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--accent);color:var(--accent-ink);text-decoration:none;font-weight:700;padding:13px 26px;border-radius:12px;font-size:17px;border:2px solid var(--accent)}
+.btn:hover{filter:brightness(1.08)}
+.btn.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
+.btn:focus-visible,a:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
+.hero{display:grid;grid-template-columns:1.1fr .9fr;gap:40px;align-items:center;padding-block:44px 64px}
+.hero h1{font-size:clamp(32px,5.4vw,54px);line-height:1.2;font-weight:700;text-wrap:balance}
+.hero p.lead{margin-top:16px;color:var(--mut);font-size:19px;max-width:34em}
+.cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:28px}
+.note{margin-top:14px;color:var(--mut);font-size:14.5px}
+/* ফোনের নকশা: আসল অ্যাপের ইউআই-এর মতো */
+.phone{justify-self:center;width:min(300px,100%);aspect-ratio:9/17;background:#0b141a;border-radius:34px;padding:12px;box-shadow:0 24px 60px -18px rgba(8,40,32,.45);border:1px solid var(--line)}
+.screen{height:100%;border-radius:24px;background:linear-gradient(#0b3a33,#0b141a);color:#e9edef;display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:44px 12px 28px;text-align:center}
+.screen .av{width:84px;height:84px;border-radius:50%;background:#3b4a54;display:grid;place-items:center;font-size:36px;font-weight:700;margin:0 auto 10px}
+.screen small{color:#9fb4ad;font-size:14px;display:block}
+.screen b{font-size:21px}
+.dots{display:flex;gap:46px}
+.dots i{width:54px;height:54px;border-radius:50%;display:grid;place-items:center;font-style:normal}
+.dots .r{background:#e53935}.dots .g{background:#25d366}
+section{padding-block:56px}
+h2{font-size:clamp(25px,3.6vw,34px);line-height:1.3;text-wrap:balance}
+.sub{color:var(--mut);margin-top:8px;max-width:36em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;margin-top:28px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:20px;min-width:0}
+.card h3{font-size:19px;margin-bottom:6px}
+.card p{color:var(--mut);font-size:16px}
+.ic{width:42px;height:42px;border-radius:12px;background:var(--soft);display:grid;place-items:center;margin-bottom:12px;color:var(--accent)}
+.ic svg{width:22px;height:22px}
+ol.steps{list-style:none;margin-top:26px;display:grid;gap:14px;counter-reset:s}
+ol.steps li{counter-reset:none;display:grid;grid-template-columns:44px 1fr;gap:14px;align-items:start;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px 18px}
+ol.steps li::before{counter-increment:s;content:counter(s,bengali);width:44px;height:44px;border-radius:50%;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-weight:700}
+ol.steps b{display:block}
+ol.steps span{color:var(--mut);font-size:16px}
+.faq{margin-top:22px;display:grid;gap:10px}
+details{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 18px}
+summary{cursor:pointer;font-weight:600}
+details p{color:var(--mut);margin-top:8px;font-size:16px}
+footer{border-top:1px solid var(--line);padding-block:26px calc(26px + env(safe-area-inset-bottom,0px));color:var(--mut);font-size:15px}
+@media (max-width:760px){.hero{grid-template-columns:1fr;padding-block:20px 40px}.phone{order:-1;width:min(230px,70%)}}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="/">
+      <svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="32" fill="var(--accent)"/><path d="M22 18c-2 0-4 2-4 5 0 13 14 27 27 27 3 0 5-2 5-4l-1-5-8-3-4 4c-4-2-8-6-10-10l4-4-3-8z" fill="var(--accent-ink)"/></svg>
+      কল চ্যাট
+    </a>
+    <a class="btn ghost" href="/app">অ্যাপ খুলুন</a>
+  </header>
+
+  <main>
+    <div class="hero">
+      <div>
+        <h1>কিছু ইনস্টল না করেই, ব্রাউজারে ভয়েস ও ভিডিও কল</h1>
+        <p class="lead">একটি নাম দিন, অনলাইনে থাকা কাউকে বেছে নিন, আর কল করুন। কল সরাসরি দুজনের ডিভাইসের মধ্যে চলে।</p>
+        <div class="cta">
+          <a class="btn" href="/app">এখনই কল করুন</a>
+          <a class="btn ghost" href="#how">কীভাবে কাজ করে</a>
+        </div>
+        <p class="note">ফোন ও কম্পিউটার দুটোতেই চলে। ফোনে ব্রাউজার মেনু থেকে "হোম স্ক্রিনে যোগ করুন" দিলে অ্যাপের মতো খুলবে।</p>
+      </div>
+      <div class="phone" role="img" aria-label="ইনকামিং কলের স্ক্রিন">
+        <div class="screen">
+          <div><div class="av">র</div><b>রিয়া</b><small>ভিডিও কল আসছে…</small></div>
+          <div class="dots"><i class="r">📵</i><i class="g">📞</i></div>
+        </div>
+      </div>
+    </div>
+
+    <section id="features">
+      <h2>যা যা পাবেন</h2>
+      <div class="grid">
+        <div class="card"><div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2z"/></svg></div><h3>ভয়েস কল</h3><p>পরিষ্কার অডিও, ইকো ও আওয়াজ কমানো, এক ট্যাপে মিউট।</p></div>
+        <div class="card"><div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="m22 8-6 4 6 4z"/></svg></div><h3>ভিডিও কল</h3><p>সামনে ও পেছনের ক্যামেরা বদল, ক্যামেরা বন্ধ করার বাটন।</p></div>
+        <div class="card"><div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>কলের মধ্যে চ্যাট</h3><p>কথা বলতে বলতেই লিংক বা নম্বর লিখে পাঠান।</p></div>
+        <div class="card"><div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><h3>সরাসরি সংযোগ</h3><p>অডিও ও ভিডিও সার্ভারের ভেতর দিয়ে যায় না, সরাসরি দুই ডিভাইসে যায়।</p></div>
+      </div>
+    </section>
+
+    <section id="how">
+      <h2>কীভাবে কাজ করে</h2>
+      <ol class="steps">
+        <li><div><b>নাম দিন</b><span>অ্যাকাউন্ট বা পাসওয়ার্ড লাগবে না।</span></div></li>
+        <li><div><b>অনলাইন তালিকা থেকে বেছে নিন</b><span>যারা এখন সাইটে আছে, তাদের নাম দেখা যাবে।</span></div></li>
+        <li><div><b>ভয়েস বা ভিডিও কল দিন</b><span>অন্যজন কল ধরলেই কথা শুরু।</span></div></li>
+      </ol>
+    </section>
+
+    <section id="faq">
+      <h2>সাধারণ প্রশ্ন</h2>
+      <div class="faq">
+        <details><summary>ক্যামেরা বা মাইক কাজ না করলে?</summary><p>ব্রাউজার অনুমতি চাইলে "অনুমতি দিন" চাপুন। অনুমতি আগে বন্ধ করে থাকলে ঠিকানার পাশের তালা আইকন থেকে চালু করুন।</p></details>
+        <details><summary>কল কি রেকর্ড হয়?</summary><p>না। সাইট কোনো কল বা চ্যাট সংরক্ষণ করে না। সার্ভার শুধু কল শুরুর সংকেত পৌঁছে দেয়।</p></details>
+        <details><summary>পেজ বন্ধ থাকলে কল আসবে?</summary><p>না। কল পেতে হলে সাইটটি খোলা থাকতে হবে। ফোনের নোটিফিকেশন এখনো নেই।</p></details>
+        <details><summary>কিছু নেটওয়ার্কে কল লাগছে না কেন?</summary><p>কড়া ফায়ারওয়াল বা কিছু মোবাইল নেটওয়ার্কে সরাসরি সংযোগ হয় না। সাইটের মালিক রিলে (TURN) সার্ভার যোগ করলে এটি ঠিক হয়।</p></details>
+      </div>
+    </section>
+  </main>
+</div>
+<footer><div class="wrap">কল চ্যাট · ব্রাউজার ভিত্তিক ভয়েস ও ভিডিও কল · <a href="/app">অ্যাপ খুলুন</a></div></footer>
+</body>
+</html>

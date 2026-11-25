@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#075e54">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<title>কল চ্যাট — অ্যাপ</title>
+<style>
+:root{--g:#075e54;--g2:#25d366;--bg:#0b141a;--card:#1f2c34;--tx:#e9edef;--mut:#8696a0;--red:#e53935}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:system-ui,-apple-system,"Noto Sans Bengali",sans-serif;background:var(--bg);color:var(--tx);height:100dvh;overflow:hidden}
+.screen{display:none;height:100dvh;flex-direction:column}
+.screen.on{display:flex}
+button{font:inherit;cursor:pointer;border:0;color:inherit}
+input{font:inherit;color:inherit}
+/* লগইন */
+#login{align-items:center;justify-content:center;padding:24px;text-align:center;gap:14px}
+#login .logo{width:84px;height:84px;border-radius:50%;background:var(--g2);display:grid;place-items:center;font-size:42px}
+#login input{width:100%;max-width:320px;padding:14px;border-radius:12px;border:1px solid #2a3942;background:var(--card);text-align:center;font-size:18px}
+.btn{background:var(--g2);color:#04210f;font-weight:700;padding:13px 28px;border-radius:24px;font-size:16px}
+#err{color:#ff8a80;min-height:20px;font-size:14px}
+/* হোম */
+header{background:var(--g);padding:14px 16px;display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:19px}
+header small{opacity:.8}
+#users{flex:1;overflow:auto;padding:6px 0}
+.user{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid #16232b}
+.av{width:46px;height:46px;border-radius:50%;background:#3b4a54;display:grid;place-items:center;font-size:19px;font-weight:700;flex:none;text-transform:uppercase}
+.user .nm{flex:1;font-size:17px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.user .nm small{display:block;color:var(--g2);font-size:12px}
+.ib{width:42px;height:42px;border-radius:50%;background:var(--card);font-size:19px}
+.empty{color:var(--mut);text-align:center;padding:48px 24px;line-height:1.7}
+/* কল */
+#call{position:fixed;inset:0;background:#0b141a;z-index:10}
+#remote{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+#local{position:absolute;right:12px;top:calc(12px + env(safe-area-inset-top));width:96px;height:136px;object-fit:cover;border-radius:12px;background:#222;border:2px solid #fff3;z-index:2;transform:scaleX(-1)}
+#info{position:relative;z-index:2;text-align:center;padding-top:calc(48px + env(safe-area-inset-top));text-shadow:0 1px 6px #000a}
+#info .av{width:110px;height:110px;font-size:46px;margin:0 auto 14px}
+#info h2{font-size:24px}
+#info p{margin-top:6px;color:#cfd8dc}
+.ctrls{position:absolute;bottom:calc(28px + env(safe-area-inset-bottom));left:0;right:0;display:flex;justify-content:center;gap:16px;z-index:3}
+.cb{width:58px;height:58px;border-radius:50%;background:#ffffff26;backdrop-filter:blur(8px);font-size:24px}
+.cb.off{background:#fff;color:#000}
+.cb.end{background:var(--red)}
+.cb.acc{background:var(--g2)}
+#chat{position:absolute;left:0;right:0;bottom:110px;max-height:46%;display:none;flex-direction:column;z-index:3;background:#0b141aee;border-radius:16px 16px 0 0}
+#chat.on{display:flex}
+#msgs{overflow:auto;padding:10px;display:flex;flex-direction:column;gap:6px}
+.m{max-width:78%;padding:7px 11px;border-radius:12px;background:var(--card);font-size:15px;word-break:break-word}
+.m.me{align-self:flex-end;background:#005c4b}
+#cf{display:flex;gap:8px;padding:8px}
+#cf input{flex:1;padding:10px 14px;border-radius:20px;border:0;background:var(--card)}
+#cf button{background:var(--g2);color:#04210f;border-radius:20px;padding:0 16px;font-weight:700}
+/* ইনকামিং */
+#incoming{position:fixed;inset:0;background:linear-gradient(#0b3a33,#0b141a);z-index:20;display:none;flex-direction:column;align-items:center;justify-content:space-between;padding:calc(90px + env(safe-area-inset-top)) 0 calc(60px + env(safe-area-inset-bottom));text-align:center}
+#incoming.on{display:flex}
+#incoming .av{width:120px;height:120px;font-size:50px;margin:0 auto 16px}
+.row{display:flex;gap:70px}
+</style>
+</head>
+<body>
+
+<section id="login" class="screen on">
+  <div class="logo">📞</div>
+  <h1>কল চ্যাট</h1>
+  <p style="color:var(--mut)">একটি নাম দিন, তারপর অন্য কাউকে কল করুন</p>
+  <input id="name" maxlength="24" placeholder="আপনার নাম" autocomplete="off">
+  <div id="err"></div>
+  <button class="btn" onclick="login()">শুরু করুন</button>
+  <a href="/" style="color:var(--mut);font-size:14px">← হোম পেজ</a>
+</section>
+
+<section id="home" class="screen">
+  <header><div><h1>কল চ্যাট</h1><small id="me"></small></div><small id="st">● অনলাইন</small></header>
+  <div id="users"></div>
+</section>
+
+<section id="call" class="screen">
+  <video id="remote" autoplay playsinline></video>
+  <video id="local" autoplay playsinline muted></video>
+  <div id="info"><div class="av" id="cav"></div><h2 id="cname"></h2><p id="cstat"></p></div>
+  <div id="chat"><div id="msgs"></div>
+    <form id="cf" onsubmit="sendChat(event)"><input id="ci" placeholder="মেসেজ লিখুন…" autocomplete="off"><button>পাঠান</button></form></div>
+  <div class="ctrls">
+    <button class="cb" id="bMute" onclick="toggleMic()">🎤</button>
+    <button class="cb" id="bCam" onclick="toggleCam()">📷</button>
+    <button class="cb" id="bFlip" onclick="flipCam()">🔄</button>
+    <button class="cb" onclick="toggleChat()">💬</button>
+    <button class="cb end" onclick="endCall()">📵</button>
+  </div>
+</section>
+
+<div id="incoming">
+  <div><div class="av" id="iav"></div><h2 id="iname" style="font-size:26px"></h2><p id="itype" style="color:#cfd8dc;margin-top:6px"></p></div>
+  <div class="row">
+    <button class="cb end" style="width:70px;height:70px" onclick="rejectCall()">📵</button>
+    <button class="cb acc" style="width:70px;height:70px" onclick="acceptCall()">📞</button>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+// ICE (STUN/TURN) কনফিগ সার্ভার থেকে আসে (/config)। TURN যোগ করতে সার্ভারে TURN_URL, TURN_USER, TURN_PASS সেট করুন।
+let ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+fetch('/config').then(r => r.json()).then(c => { if (c && c.iceServers) ICE = c; }).catch(() => {});
+
+let me = null, es = null, pc = null, dc = null, localStream = null;
+let peer = null, incoming = null, pendingIce = [], withVideo = false, timer = null, startedAt = 0;
+let onlineUsers = [];
+let outIce = null;          // কলার: offer পাঠানোর আগের ICE candidate জমা রাখে
+let ringTimeout = null, discTimer = null, retryTimer = null, facing = 'user', wantOnline = false;
+
+function show(id){ document.querySelectorAll('.screen').forEach(s => s.classList.toggle('on', s.id === id)); }
+const initial = n => (n || '?').trim().charAt(0);
+
+/* ---------- সংযোগ ---------- */
+function login(){
+  const n = $('#name').value.trim();
+  if (!n) return;
+  $('#err').textContent = '';
+  initAudio();
+  try { localStorage.setItem('callname', n); } catch {}
+  connect(n);
+}
+$('#name').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+try { const s = localStorage.getItem('callname'); if (s) $('#name').value = s; } catch {}
+
+function connect(name, isRetry){
+  clearTimeout(retryTimer);
+  if (es) es.close();
+  wantOnline = true;
+  es = new EventSource('/events?user=' + encodeURIComponent(name));
+  let ok = false;
+  es.addEventListener('hello', () => {
+    ok = true; me = name;
+    $('#me').textContent = name; $('#st').textContent = '● অনলাইন';
+    if (!$('#call').classList.contains('on')) show('home');
+  });
+  es.addEventListener('users', e => { onlineUsers = JSON.parse(e.data); renderUsers(); checkPeerPresent(); });
+  es.addEventListener('signal', e => onSignal(JSON.parse(e.data)));
+  es.onerror = () => {
+    if (!ok) {
+      es.close();
+      if (isRetry) { $('#st').textContent = '○ পুনরায় সংযোগ হচ্ছে…'; retryTimer = setTimeout(() => connect(name, true), 2000); }
+      else $('#err').textContent = 'নামটি আগে থেকেই ব্যবহৃত, অথবা সার্ভারে সংযোগ হয়নি।';
+    } else {
+      // সংযোগ ছিন্ন: ব্রাউজার নিজে চেষ্টা করে, কিন্তু সার্ভার পুরনো নাম ছাড়তে দেরি করলে ব্যর্থ হতে পারে — তাই নিজেই আবার চেষ্টা করি
+      $('#st').textContent = '○ পুনরায় সংযোগ হচ্ছে…';
+      es.close();
+      retryTimer = setTimeout(() => connect(name, true), 1500);
+    }
+  };
+}
+
+// কল চলাকালীন অন্য পক্ষ অফলাইন হলে কল শেষ করি
+function checkPeerPresent(){
+  if (peer && pc && !onlineUsers.includes(peer)) cleanup('ইউজার অফলাইন হয়ে গেছে');
+  else if (incoming && !onlineUsers.includes(incoming.from)) cleanup('মিসড কল');
+}
+
+function renderUsers(){
+  const others = onlineUsers.filter(u => u !== me);
+  const box = $('#users');
+  if (!others.length) {
+    box.innerHTML = '<div class="empty">এখন আর কেউ অনলাইনে নেই।<br>অন্য ফোন বা ডিভাইসে এই অ্যাপ খুলে আরেকটি নাম দিয়ে ঢুকুন।</div>';
+    return;
+  }
+  box.innerHTML = '';
+  others.forEach(u => {
+    const d = document.createElement('div');
+    d.className = 'user';
+    d.innerHTML = `<div class="av"></div><div class="nm"></div><button class="ib" title="ভয়েস কল">📞</button><button class="ib" title="ভিডিও কল">🎥</button>`;
+    d.querySelector('.av').textContent = initial(u);
+    d.querySelector('.nm').innerHTML = '<span></span><small>অনলাইন</small>';
+    d.querySelector('.nm span').textContent = u;
+    const [b1, b2] = d.querySelectorAll('.ib');
+    b1.onclick = () => startCall(u, false);
+    b2.onclick = () => startCall(u, true);
+    box.appendChild(d);
+  });
+}
+
+function sig(to, type, data){
+  return fetch('/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: me, to, type, data }) }).catch(() => {});
+}
+
+/* ---------- রিংটোন ---------- */
+let actx = null, ringT = null;
+function initAudio(){ try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); } catch {} }
+function beep(freq, dur){
+  if (!actx) return;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.frequency.value = freq; g.gain.value = 0.12;
+  o.connect(g); g.connect(actx.destination); o.start(); o.stop(actx.currentTime + dur);
+}
+function ring(kind){
+  stopRing();
+  const play = () => { if (kind === 'in') { beep(880, .25); setTimeout(() => beep(660, .25), 300); if (navigator.vibrate) navigator.vibrate([300, 150, 300]); } else beep(440, .6); };
+  play(); ringT = setInterval(play, kind === 'in' ? 1800 : 3000);
+}
+function stopRing(){ clearInterval(ringT); ringT = null; if (navigator.vibrate) navigator.vibrate(0); }
+
+/* ---------- কল শুরু (কলার) ---------- */
+async function getMedia(video){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('insecure');
+  return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: video ? { facingMode: facing } : false });
+}
+function mediaError(e, video){
+  if (e && e.message === 'insecure') return 'মাইক/ক্যামেরা চালাতে পেজটি HTTPS (বা localhost) এ খুলতে হবে।';
+  return 'মাইক্রোফোন' + (video ? '/ক্যামেরা' : '') + ' ব্যবহারের অনুমতি দিন।';
+}
+
+async function startCall(to, video){
+  if (pc || incoming) return;
+  initAudio();
+  try { localStream = await getMedia(video); }
+  catch (e) { alert(mediaError(e, video)); return; }
+  peer = to; withVideo = video;
+  openCallUI('রিং হচ্ছে…');
+  ring('out');
+  outIce = [];
+  setupPC();
+  dc = pc.createDataChannel('chat'); setupDC();
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const r = await fetch('/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: me, to, type: 'offer', data: { sdp: pc.localDescription, video } }) });
+    if (!r.ok) throw new Error('offline');
+  } catch { return cleanup('ইউজার এখন অনলাইনে নেই'); }
+  // offer পৌঁছানোর পরই ICE candidate পাঠাই, যাতে ক্রম ঠিক থাকে
+  const q = outIce; outIce = null;
+  q.forEach(c => sig(to, 'ice', c));
+  // ৪৫ সেকেন্ডে না ধরলে কল কেটে দিই
+  ringTimeout = setTimeout(() => { if (pc && pc.connectionState !== 'connected') { sig(peer, 'hangup'); cleanup('কেউ ধরেনি'); } }, 45000);
+}
+
+function setupPC(){
+  pc = new RTCPeerConnection(ICE);
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc.onicecandidate = e => {
+    if (!e.candidate) return;
+    if (outIce) outIce.push(e.candidate); else sig(peer, 'ice', e.candidate);
+  };
+  pc.ontrack = e => { $('#remote').srcObject = e.streams[0]; };
+  pc.ondatachannel = e => { dc = e.channel; setupDC(); };
+  pc.onconnectionstatechange = () => {
+    const s = pc && pc.connectionState;
+    clearTimeout(discTimer);
+    if (s === 'connected') {
+      clearTimeout(ringTimeout); stopRing(); startTimer();
+      if (withVideo) $('#info').style.display = 'none';
+    }
+    // নেটওয়ার্ক সাময়িক গেলে ১০ সেকেন্ড অপেক্ষা, তারপর কল শেষ
+    if (s === 'disconnected') { $('#cstat').textContent = 'সংযোগ দুর্বল…'; discTimer = setTimeout(() => cleanup('সংযোগ বিচ্ছিন্ন হয়েছে'), 10000); }
+    if (s === 'failed') cleanup('সংযোগ বিচ্ছিন্ন হয়েছে');
+  };
+}
+
+function openCallUI(status){
+  $('#cav').textContent = initial(peer);
+  $('#cname').textContent = peer;
+  $('#cstat').textContent = status;
+  $('#info').style.display = '';
+  $('#msgs').innerHTML = '';
+  $('#chat').classList.remove('on');
+  const lv = $('#local');
+  lv.style.display = withVideo ? '' : 'none';
+  lv.srcObject = localStream;
+  $('#remote').style.visibility = withVideo ? 'visible' : 'hidden';
+  $('#bCam').style.display = withVideo ? '' : 'none';
+  $('#bFlip').style.display = withVideo ? '' : 'none';
+  $('#local').style.transform = 'scaleX(-1)';
+  $('#bMute').classList.remove('off'); $('#bMute').textContent = '🎤';
+  $('#bCam').classList.remove('off'); $('#bCam').textContent = '📷';
+  show('call');
+}
+
+function startTimer(){
+  startedAt = Date.now(); clearInterval(timer);
+  timer = setInterval(() => {
+    const s = Math.floor((Date.now() - startedAt) / 1000);
+    $('#cstat').textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }, 1000);
+}
+
+/* ---------- সিগন্যাল গ্রহণ ---------- */
+async function onSignal({ from, type, data }){
+  if (type === 'offer') {
+    if (pc || incoming) return sig(from, 'busy');
+    incoming = { from, data };
+    pendingIce = [];
+    $('#iav').textContent = initial(from);
+    $('#iname').textContent = from;
+    $('#itype').textContent = data.video ? 'ভিডিও কল আসছে…' : 'ভয়েস কল আসছে…';
+    $('#incoming').classList.add('on');
+    ring('in');
+  } else if (type === 'answer') {
+    if (pc && from === peer) {
+      try { await pc.setRemoteDescription(data); await flushIce(); }
+      catch { sig(from, 'hangup'); cleanup('কল সংযুক্ত করা যায়নি'); }
+    }
+  } else if (type === 'ice') {
+    if (pc && from === peer) {
+      if (pc.remoteDescription) pc.addIceCandidate(data).catch(() => {}); else pendingIce.push(data);
+    } else if (incoming && from === incoming.from) pendingIce.push(data);
+  } else if (type === 'reject') {
+    if (from === peer) cleanup('কল প্রত্যাখ্যান করা হয়েছে');
+  } else if (type === 'busy') {
+    if (from === peer) cleanup('ইউজার অন্য কলে ব্যস্ত');
+  } else if (type === 'hangup') {
+    if (incoming && from === incoming.from) cleanup('মিসড কল');
+    else if (from === peer) cleanup('কল শেষ হয়েছে');
+  }
+}
+
+async function flushIce(){
+  for (const c of pendingIce) await pc.addIceCandidate(c).catch(() => {});
+  pendingIce = [];
+}
+
+/* ---------- রিসিভার ---------- */
+async function acceptCall(){
+  if (!incoming) return;
+  const { from, data } = incoming;
+  stopRing();
+  try { localStream = await getMedia(data.video); }
+  catch (e) { alert(mediaError(e, data.video)); return rejectCall(); }
+  if (!incoming) { localStream.getTracks().forEach(t => t.stop()); localStream = null; return; } // ইতিমধ্যে কেটে গেছে
+  incoming = null; peer = from; withVideo = data.video;
+  $('#incoming').classList.remove('on');
+  openCallUI('সংযুক্ত হচ্ছে…');
+  setupPC();
+  try {
+    await pc.setRemoteDescription(data.sdp);
+    await flushIce();
+    const ans = await pc.createAnswer();
+    await pc.setLocalDescription(ans);
+    await sig(from, 'answer', pc.localDescription);
+  } catch { sig(from, 'hangup'); cleanup('কল সংযুক্ত করা যায়নি'); }
+}
+
+function rejectCall(){
+  if (incoming) sig(incoming.from, 'reject');
+  incoming = null; pendingIce = [];
+  stopRing(); $('#incoming').classList.remove('on');
+}
+
+function endCall(){
+  if (peer) sig(peer, 'hangup');
+  cleanup('');
+}
+
+function cleanup(msg){
+  stopRing(); clearInterval(timer); clearTimeout(ringTimeout); clearTimeout(discTimer);
+  outIce = null; facing = 'user';
+  if (dc) { try { dc.close(); } catch {} }
+  if (pc) { pc.onconnectionstatechange = null; pc.close(); }
+  if (localStream) localStream.getTracks().forEach(t => t.stop());
+  pc = dc = localStream = peer = incoming = null; pendingIce = [];
+  $('#remote').srcObject = null; $('#local').srcObject = null;
+  $('#incoming').classList.remove('on');
+  show('home');
+  if (msg) { $('#st').textContent = msg; setTimeout(() => { $('#st').textContent = '● অনলাইন'; }, 3500); }
+}
+
+/* ---------- কন্ট্রোল ---------- */
+function toggleMic(){
+  if (!localStream) return;
+  const t = localStream.getAudioTracks()[0]; if (!t) return;
+  t.enabled = !t.enabled;
+  $('#bMute').classList.toggle('off', !t.enabled);
+  $('#bMute').textContent = t.enabled ? '🎤' : '🔇';
+}
+function toggleCam(){
+  if (!localStream) return;
+  const t = localStream.getVideoTracks()[0]; if (!t) return;
+  t.enabled = !t.enabled;
+  $('#bCam').classList.toggle('off', !t.enabled);
+}
+function toggleChat(){ $('#chat').classList.toggle('on'); }
+
+// সামনের/পেছনের ক্যামেরা বদল
+async function flipCam(){
+  if (!pc || !localStream || !withVideo) return;
+  const next = facing === 'user' ? 'environment' : 'user';
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: next } });
+    const nt = s.getVideoTracks()[0];
+    const sender = pc.getSenders().find(x => x.track && x.track.kind === 'video');
+    if (sender) await sender.replaceTrack(nt);
+    localStream.getVideoTracks().forEach(t => { localStream.removeTrack(t); t.stop(); });
+    localStream.addTrack(nt);
+    $('#local').srcObject = localStream;
+    $('#local').style.transform = next === 'user' ? 'scaleX(-1)' : 'none';
+    facing = next;
+    $('#bCam').classList.remove('off');
+  } catch { /* ডিভাইসে একটিই ক্যামেরা থাকলে কিছু হবে না */ }
+}
+
+// ট্যাব বন্ধ করলে অন্য পক্ষকে জানাই
+window.addEventListener('pagehide', () => {
+  if (peer && me) navigator.sendBeacon('/signal', new Blob([JSON.stringify({ from: me, to: peer, type: 'hangup' })], { type: 'application/json' }));
+});
+
+/* ---------- কলের ভেতরে চ্যাট ---------- */
+function setupDC(){
+  dc.onmessage = e => addMsg(e.data, false);
+}
+function addMsg(text, mine){
+  const d = document.createElement('div');
+  d.className = 'm' + (mine ? ' me' : '');
+  d.textContent = text;
+  $('#msgs').appendChild(d);
+  $('#msgs').scrollTop = 1e9;
+}
+function sendChat(e){
+  e.preventDefault();
+  const t = $('#ci').value.trim();
+  if (!t || !dc || dc.readyState !== 'open') return;
+  dc.send(t); addMsg(t, true); $('#ci').value = '';
+}
+
+</script>
+</body>
+</html>
