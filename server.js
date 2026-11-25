@@ -6,10 +6,17 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
+const MAX_CLIENTS = 500;        // একসঙ্গে সর্বোচ্চ অনলাইন ইউজার
+const MAX_PER_IP = 20;          // এক IP থেকে সর্বোচ্চ সংযোগ
+const MAX_SIGNALS_PER_MIN = 600; // এক ইউজারের মিনিটে সর্বোচ্চ সিগন্যাল
 const TYPES = new Set(['offer', 'answer', 'ice', 'hangup', 'reject', 'busy']);
-const clients = new Map(); // ইউজারনেম -> SSE response
+
+// ইউজারনেম -> { res, token, ip, count }
+const clients = new Map();
+const ipCount = new Map();
 
 const cleanName = (s) => String(s || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 24);
 
@@ -42,47 +49,83 @@ const ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect 
 
 const PAGES = { '/': 'index.html', '/index.html': 'index.html', '/app': 'app.html', '/app.html': 'app.html' };
 
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src https://fonts.gstatic.com",
+  "img-src 'self' data:",
+  "media-src 'self' blob:",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+].join('; ');
+
+function safeWrite(res, text) {
+  try { res.write(text); } catch { /* সংযোগ আগেই বন্ধ */ }
+}
+
 function send(res, event, data) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  safeWrite(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 function broadcastUsers() {
   const list = [...clients.keys()];
-  for (const res of clients.values()) send(res, 'users', list);
+  for (const c of clients.values()) send(c.res, 'users', list);
 }
 
-const SECURITY = {
-  'X-Content-Type-Options': 'nosniff',
-  'Referrer-Policy': 'no-referrer',
-  'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=()',
-};
+function clientIp(req) {
+  const xf = req.headers['x-forwarded-for'];
+  if (xf) return String(xf).split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function dropClient(user, c) {
+  if (clients.get(user) !== c) return;
+  clients.delete(user);
+  const n = (ipCount.get(c.ip) || 1) - 1;
+  if (n <= 0) ipCount.delete(c.ip); else ipCount.set(c.ip, n);
+  broadcastUsers();
+}
+
+// প্রতি মিনিটে সিগন্যাল গণনা শূন্য করি
+setInterval(() => { for (const c of clients.values()) c.count = 0; }, 60000).unref();
 
 const server = http.createServer((req, res) => {
-  for (const [k, v] of Object.entries(SECURITY)) res.setHeader(k, v);
-  const url = new URL(req.url, 'http://localhost');
+  res.on('error', () => {});
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
+  if (req.headers['x-forwarded-proto'] === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+  }
+  let url;
+  try { url = new URL(req.url, 'http://localhost'); }
+  catch { res.writeHead(400); return res.end(); }
 
   // ক্লায়েন্ট সংযোগ (Server-Sent Events)
   if (req.method === 'GET' && url.pathname === '/events') {
     const user = cleanName(url.searchParams.get('user'));
     if (!user) { res.writeHead(400); return res.end('name required'); }
     if (clients.has(user)) { res.writeHead(409); return res.end('name taken'); }
+    if (clients.size >= MAX_CLIENTS) { res.writeHead(503); return res.end('server full'); }
+    const ip = clientIp(req);
+    if ((ipCount.get(ip) || 0) >= MAX_PER_IP) { res.writeHead(429); return res.end('too many connections'); }
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    clients.set(user, res);
-    send(res, 'hello', { user });
+    const c = { res, token: crypto.randomBytes(16).toString('hex'), ip, count: 0 };
+    clients.set(user, c);
+    ipCount.set(ip, (ipCount.get(ip) || 0) + 1);
+    send(res, 'hello', { user, token: c.token });
     broadcastUsers();
-    const hb = setInterval(() => res.write(':hb\n\n'), 15000);
-    req.on('close', () => {
-      clearInterval(hb);
-      if (clients.get(user) === res) {
-        clients.delete(user);
-        broadcastUsers();
-      }
-    });
+    const hb = setInterval(() => safeWrite(res, ':hb\n\n'), 15000);
+    req.on('close', () => { clearInterval(hb); dropClient(user, c); });
     return;
   }
 
@@ -90,24 +133,32 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && url.pathname === '/signal') {
     let body = '';
     let tooBig = false;
-    req.on('data', (c) => {
-      body += c;
+    req.on('data', (chunk) => {
+      body += chunk;
       if (body.length > 100000) { tooBig = true; req.destroy(); }
     });
     req.on('end', () => {
       if (tooBig) return;
       try {
-        const { from, to, type, data } = JSON.parse(body);
+        const { from, to, type, data, token } = JSON.parse(body);
+        if (typeof from !== 'string' || typeof to !== 'string') { res.writeHead(400); return res.end('bad request'); }
         if (!TYPES.has(type)) { res.writeHead(400); return res.end('bad type'); }
-        if (!clients.has(from)) { res.writeHead(403); return res.end(); }
+        const sender = clients.get(from);
+        // টোকেন না মিললে অন্য কারও নামে সিগন্যাল পাঠানো যাবে না
+        if (!sender || typeof token !== 'string' || token.length !== sender.token.length ||
+            !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(sender.token))) {
+          res.writeHead(403); return res.end('forbidden');
+        }
+        if (++sender.count > MAX_SIGNALS_PER_MIN) { res.writeHead(429); return res.end('slow down'); }
         const target = clients.get(to);
         if (!target || to === from) { res.writeHead(404); return res.end('offline'); }
-        send(target, 'signal', { from, type, data });
+        send(target.res, 'signal', { from, type, data });
         res.writeHead(200); res.end('ok');
       } catch {
         res.writeHead(400); res.end('bad request');
       }
     });
+    req.on('error', () => {});
     return;
   }
 
@@ -117,7 +168,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({ ok: true, online: clients.size }));
   }
 
@@ -132,11 +183,15 @@ const server = http.createServer((req, res) => {
   }
 
   // পেজ: / = ল্যান্ডিং, /app = কলিং অ্যাপ
-  if (req.method === 'GET' && PAGES[url.pathname]) {
+  if ((req.method === 'GET' || req.method === 'HEAD') && PAGES[url.pathname]) {
     fs.readFile(path.join(__dirname, PAGES[url.pathname]), (err, buf) => {
       if (err) { res.writeHead(500); return res.end('page not found'); }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
-      res.end(buf);
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Content-Security-Policy': CSP,
+      });
+      res.end(req.method === 'HEAD' ? undefined : buf);
     });
     return;
   }
@@ -145,4 +200,21 @@ const server = http.createServer((req, res) => {
   res.end('পেজ পাওয়া যায়নি');
 });
 
+// Render/প্রক্সির টাইমআউটের চেয়ে বেশি রাখি, যাতে সংযোগ হঠাৎ কাটে না
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+
 server.listen(PORT, () => console.log(`সার্ভার চালু: http://localhost:${PORT}`));
+
+// একটি ভুলে যেন পুরো সার্ভার বন্ধ না হয়
+process.on('uncaughtException', (e) => console.error('uncaughtException:', e));
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
+
+// নতুন ভার্সন ডিপ্লয়ের সময় ভদ্রভাবে বন্ধ হই (ক্লায়েন্ট নিজে আবার সংযুক্ত হবে)
+function shutdown() {
+  for (const c of clients.values()) { try { c.res.end(); } catch {} }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
