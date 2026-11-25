@@ -102,16 +102,23 @@ header small{opacity:.8}
 
 <script>
 const $ = s => document.querySelector(s);
-// ICE (STUN/TURN) কনফিগ সার্ভার থেকে আসে (/config)। TURN যোগ করতে সার্ভারে TURN_URL, TURN_USER, TURN_PASS সেট করুন।
-let ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-fetch('/config').then(r => r.json()).then(c => { if (c && c.iceServers) ICE = c; }).catch(() => {});
+
+let ICE = {
+  iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }],
+  iceCandidatePoolSize: 8,
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require'
+};
+fetch('/config').then(r => r.json()).then(c => {
+  if (c && c.iceServers) ICE = { ...ICE, ...c, iceCandidatePoolSize: 8 };
+}).catch(() => {});
 
 let me = null, es = null, pc = null, dc = null, localStream = null;
 let peer = null, incoming = null, pendingIce = [], withVideo = false, timer = null, startedAt = 0;
-let onlineUsers = [];
-let remoteStream = null, token = null, wakeLock = null;
-let outIce = null;        // কলার: offer পাঠানোর আগের ICE candidate জমা রাখে
-let ringTimeout = null, discTimer = null, retryTimer = null, facing = 'user', wantOnline = false;
+let onlineUsers = [], remoteStream = null, token = null, wakeLock = null;
+let offerReady = false, outIce = [], iceFlushTimer = null, sigQueue = Promise.resolve();
+let ringTimeout = null, discTimer = null, iceRestartTimer = null, retryTimer = null;
+let facing = 'user', wantOnline = false, mediaPromise = null;
 
 function show(id){ document.querySelectorAll('.screen').forEach(s => s.classList.toggle('on', s.id === id)); }
 const initial = n => (n || '?').trim().charAt(0);
@@ -145,22 +152,19 @@ function connect(name, isRetry){
   es.onerror = () => {
     if (!ok) {
       es.close();
-      if (isRetry) { $('#st').textContent = '○ পুনরায় সংযোগ হচ্ছে…'; retryTimer = setTimeout(() => connect(name, true), 2000); }
+      if (isRetry) { $('#st').textContent = '○ পুনরায় সংযোগ হচ্ছে…'; retryTimer = setTimeout(() => connect(name, true), 1500); }
       else $('#err').textContent = 'নামটি আগে থেকেই ব্যবহৃত, অথবা সার্ভারে সংযোগ হয়নি।';
     } else {
-      // সংযোগ ছিন্ন: ব্রাউজার নিজে চেষ্টা করে, কিন্তু সার্ভার পুরনো নাম ছাড়তে দেরি করলে ব্যর্থ হতে পারে — তাই নিজেই আবার চেষ্টা করি
       $('#st').textContent = '○ পুনরায় সংযোগ হচ্ছে…';
       es.close();
-      retryTimer = setTimeout(() => connect(name, true), 1500);
+      retryTimer = setTimeout(() => connect(name, true), 1200);
     }
   };
 }
 
-// কল চলাকালীন অন্য পক্ষ অফলাইন হলে কল শেষ করি
 function checkPeerPresent(){
   if (incoming && !onlineUsers.includes(incoming.from)) cleanup('মিসড কল');
-  // সংযুক্ত কল সরাসরি দুই ডিভাইসের মধ্যে চলে। সার্ভার রিস্টার্ট হলে তালিকা সাময়িক খালি দেখাতে পারে, তাই চলমান কল কাটি না
-  else if (peer && pc && pc.connectionState !== 'connected' && !onlineUsers.includes(peer)) cleanup('ইউজার অফলাইন হয়ে গেছে');
+  else if (peer && pc && !['connected', 'completed'].includes(pc.connectionState) && !onlineUsers.includes(peer)) cleanup('ইউজার অফলাইন হয়ে গেছে');
 }
 
 function renderUsers(){
@@ -185,27 +189,59 @@ function renderUsers(){
   });
 }
 
-// সিগন্যাল পাঠাই; নেটওয়ার্ক ত্রুটি হলে দুবার আবার চেষ্টা করি। সফল না হলে null ফেরত দেয়।
-async function sig(to, type, data){
-  for (let i = 0; i < 3; i++) {
-    try {
-      return await fetch('/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from: me, token, to, type, data }) });
-    } catch { await new Promise(r => setTimeout(r, 400 * (i + 1))); }
-  }
-  return null;
+// সিরিয়াল সিগন্যাল কিউ: offer-এর আগে ice যাওয়া বা রিকোয়েস্ট জ্যাম হওয়া ঠেকায়
+function sig(to, type, data){
+  const task = async () => {
+    for (let i = 0; i < 3; i++) {
+      try {
+        const res = await fetch('/signal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: me, token, to, type, data })
+        });
+        if (res.ok) return res;
+      } catch {}
+      await new Promise(r => setTimeout(r, 150 * (i + 1)));
+    }
+    return null;
+  };
+  const next = sigQueue.then(task, task);
+  sigQueue = next.catch(() => null);
+  return next;
 }
 
-// সংযোগ ছিন্ন থাকলে (ব্যাকগ্রাউন্ড/নেট ফিরে এলে) আবার সংযুক্ত হই
+// একাধিক ICE candidate একসাথে ব্যাচ করে পাঠায়, যাতে নেটওয়ার্ক ওভারহেড কমে এবং দ্রুত পৌঁছায়
+function queueIce(to, cand){
+  if (!cand) return;
+  outIce.push(cand);
+  if (!offerReady) return;
+  clearTimeout(iceFlushTimer);
+  iceFlushTimer = setTimeout(flushOutIce, 25);
+}
+
+function flushOutIce(){
+  clearTimeout(iceFlushTimer);
+  iceFlushTimer = null;
+  if (!offerReady || !outIce.length || !peer) return;
+  const batch = outIce.splice(0, outIce.length);
+  sig(peer, 'ice', batch.length === 1 ? batch[0] : batch);
+}
+
 function ensureConnected(){
   if (wantOnline && me && (!es || es.readyState === 2)) connect(me, true);
 }
 window.addEventListener('online', ensureConnected);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { ensureConnected(); if (pc) keepAwake(); } });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { ensureConnected(); if (pc) keepAwake(); }
+});
 
-// কল চলার সময় স্ক্রিন জাগিয়ে রাখি (না হলে ফোনের স্ক্রিন বন্ধ হলে কল কেটে যেতে পারে)
 async function keepAwake(){
-  try { if ('wakeLock' in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } } catch {}
+  try {
+    if ('wakeLock' in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  } catch {}
 }
 function releaseAwake(){ try { if (wakeLock) wakeLock.release(); } catch {} wakeLock = null; }
 
@@ -220,33 +256,52 @@ function beep(freq, dur){
 }
 function ring(kind){
   stopRing();
-  const play = () => { if (kind === 'in') { beep(880, .25); setTimeout(() => beep(660, .25), 300); if (navigator.vibrate) navigator.vibrate([300, 150, 300]); } else beep(440, .6); };
-  play(); ringT = setInterval(play, kind === 'in' ? 1800 : 3000);
+  const play = () => {
+    if (kind === 'in') {
+      beep(880, .25);
+      setTimeout(() => beep(660, .25), 300);
+      if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
+    } else beep(440, .5);
+  };
+  play();
+  ringT = setInterval(play, kind === 'in' ? 1600 : 2400);
 }
 function stopRing(){ clearInterval(ringT); ringT = null; if (navigator.vibrate) navigator.vibrate(0); }
 
-/* ---------- কল শুরু (কলার) ---------- */
-async function getMedia(video){
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('insecure');
-  return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: video ? { facingMode: facing } : false });
+/* ---------- মিডিয়া ও কল শুরু (কলার) ---------- */
+function getMedia(video){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('insecure'));
+  return navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    video: video ? { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24, max: 30 } } : false
+  });
 }
+
 function mediaError(e, video){
   if (e && e.message === 'insecure') return 'মাইক/ক্যামেরা চালাতে পেজটি HTTPS (বা localhost) এ খুলতে হবে।';
   return 'মাইক্রোফোন' + (video ? '/ক্যামেরা' : '') + ' ব্যবহারের অনুমতি দিন।';
 }
 
-// মাইক/ক্যামেরা চালু হলে সংশ্লিষ্ট sender-এ বসাই (নতুন করে দর-কষাকষি লাগে না)
 function attachMedia(stream, myPc){
-  if (pc !== myPc) { stream.getTracks().forEach(t => t.stop()); return; }
+  if (!myPc || pc !== myPc || myPc.signalingState === 'closed') {
+    stream.getTracks().forEach(t => t.stop());
+    return;
+  }
   localStream = stream;
   for (const t of stream.getTracks()) {
-    const tr = pc.getTransceivers().find(x => x.receiver.track && x.receiver.track.kind === t.kind && !x.sender.track);
-    if (tr) tr.sender.replaceTrack(t); else pc.addTrack(t, stream);
+    const tr = myPc.getTransceivers().find(x => x.receiver.track && x.receiver.track.kind === t.kind);
+    if (tr) {
+      tr.direction = 'sendrecv';
+      tr.sender.replaceTrack(t).catch(() => {});
+    } else {
+      myPc.addTrack(t, stream);
+    }
   }
   $('#local').srcObject = stream;
 }
+
 function mediaFailed(e, myPc, video){
-  if (pc !== myPc) return;
+  if (!myPc || pc !== myPc) return;
   if (peer) sig(peer, 'hangup');
   cleanup('');
   alert(mediaError(e, video));
@@ -255,52 +310,105 @@ function mediaFailed(e, myPc, video){
 async function startCall(to, video){
   if (pc || incoming) return;
   initAudio();
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert(mediaError(new Error('insecure'), video)); return; }
-  peer = to; withVideo = video; localStream = null;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert(mediaError(new Error('insecure'), video));
+    return;
+  }
+  peer = to; withVideo = video; localStream = null; offerReady = false; outIce = [];
   openCallUI('রিং হচ্ছে…');
   ring('out');
-  outIce = [];
   setupPC();
   const myPc = pc;
-  pc.addTransceiver('audio', { direction: 'sendrecv' });
-  if (video) pc.addTransceiver('video', { direction: 'sendrecv' });
-  dc = pc.createDataChannel('chat'); setupDC();
-  // মাইক/ক্যামেরা চালুর অপেক্ষা না করেই কল পাঠাই, যাতে অন্যজনের ফোনে দ্রুত রিং হয়
-  getMedia(video).then(s => attachMedia(s, myPc)).catch(e => mediaFailed(e, myPc, video));
+
+  myPc.addTransceiver('audio', { direction: 'sendrecv' });
+  if (video) myPc.addTransceiver('video', { direction: 'sendrecv' });
+  dc = myPc.createDataChannel('chat', { ordered: true });
+  setupDC();
+
+  mediaPromise = getMedia(video)
+    .then(s => { attachMedia(s, myPc); return s; })
+    .catch(e => { mediaFailed(e, myPc, video); return null; });
+
   try {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    const r = await sig(to, 'offer', { sdp: pc.localDescription, video });
+    const offer = await myPc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: video });
+    if (pc !== myPc) return;
+    await myPc.setLocalDescription(offer);
+    const r = await sig(to, 'offer', { sdp: myPc.localDescription, video });
     if (!r || !r.ok) throw new Error('offline');
-  } catch { return cleanup('ইউজার এখন অনলাইনে নেই'); }
-  // offer পৌঁছানোর পরই ICE candidate পাঠাই, যাতে ক্রম ঠিক থাকে
-  const q = outIce; outIce = null;
-  q.forEach(c => sig(to, 'ice', c));
-  // ৪৫ সেকেন্ডে না ধরলে কল কেটে দিই
-  ringTimeout = setTimeout(() => { if (pc && pc.connectionState !== 'connected') { sig(peer, 'hangup'); cleanup('কেউ ধরেনি'); } }, 45000);
+    if (pc !== myPc) return;
+    offerReady = true;
+    flushOutIce();
+  } catch {
+    if (pc === myPc) return cleanup('ইউজার এখন অনলাইনে নেই');
+  }
+
+  ringTimeout = setTimeout(() => {
+    if (pc === myPc && !['connected', 'completed'].includes(myPc.connectionState)) {
+      sig(peer, 'hangup');
+      cleanup('কেউ ধরেনি');
+    }
+  }, 45000);
 }
 
 function setupPC(){
-  pc = new RTCPeerConnection({ ...ICE, iceCandidatePoolSize: 4 }); // ICE আগে থেকেই জোগাড় শুরু
+  pc = new RTCPeerConnection(ICE);
+  const myPc = pc;
   remoteStream = new MediaStream();
   $('#remote').srcObject = remoteStream;
+
   pc.onicecandidate = e => {
-    if (!e.candidate) return;
-    if (outIce) outIce.push(e.candidate); else sig(peer, 'ice', e.candidate);
+    if (pc !== myPc) return;
+    if (e.candidate) queueIce(peer, e.candidate);
+    else flushOutIce();
   };
-  pc.ontrack = e => { remoteStream.addTrack(e.track); $('#remote').play().catch(() => {}); };
-  pc.ondatachannel = e => { dc = e.channel; setupDC(); };
+
+  pc.ontrack = e => {
+    if (pc !== myPc) return;
+    remoteStream.addTrack(e.track);
+    $('#remote').play().catch(() => {});
+  };
+
+  pc.ondatachannel = e => {
+    if (pc !== myPc) return;
+    dc = e.channel;
+    setupDC();
+  };
+
   pc.onconnectionstatechange = () => {
-    const s = pc && pc.connectionState;
+    if (pc !== myPc) return;
+    const s = myPc.connectionState;
     clearTimeout(discTimer);
-    if (s === 'connected') {
-      clearTimeout(ringTimeout); stopRing(); startTimer(); keepAwake();
+    if (s === 'connected' || s === 'completed') {
+      clearTimeout(ringTimeout);
+      clearTimeout(iceRestartTimer);
+      stopRing();
+      startTimer();
+      keepAwake();
       $('#remote').play().catch(() => {});
       if (withVideo) $('#info').style.display = 'none';
+    } else if (s === 'disconnected') {
+      $('#cstat').textContent = 'সংযোগ পুনঃস্থাপন হচ্ছে…';
+      if (typeof myPc.restartIce === 'function') {
+        try { myPc.restartIce(); } catch {}
+      }
+      discTimer = setTimeout(() => {
+        if (pc === myPc && pc.connectionState === 'disconnected') cleanup('সংযোগ বিচ্ছিন্ন হয়েছে');
+      }, 8000);
+    } else if (s === 'failed') {
+      cleanup('সংযোগ বিচ্ছিন্ন হয়েছে');
     }
-    // নেটওয়ার্ক সাময়িক গেলে ১০ সেকেন্ড অপেক্ষা, তারপর কল শেষ
-    if (s === 'disconnected') { $('#cstat').textContent = 'সংযোগ দুর্বল…'; discTimer = setTimeout(() => cleanup('সংযোগ বিচ্ছিন্ন হয়েছে'), 10000); }
-    if (s === 'failed') cleanup('সংযোগ বিচ্ছিন্ন হয়েছে');
+  };
+}
+
+function setupDC(){
+  if (!dc) return;
+  dc.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg && msg.type === 'chat') appendMsg(msg.text, false);
+    } catch {
+      appendMsg(String(e.data), false);
+    }
   };
 }
 
@@ -317,7 +425,7 @@ function openCallUI(status){
   $('#remote').style.visibility = withVideo ? 'visible' : 'hidden';
   $('#bCam').style.display = withVideo ? '' : 'none';
   $('#bFlip').style.display = withVideo ? '' : 'none';
-  $('#local').style.transform = 'scaleX(-1)';
+  $('#local').style.transform = facing === 'user' ? 'scaleX(-1)' : 'none';
   $('#bMute').classList.remove('off'); $('#bMute').textContent = '🎤';
   $('#bCam').classList.remove('off'); $('#bCam').textContent = '📷';
   show('call');
@@ -335,26 +443,46 @@ function startTimer(){
 async function onSignal({ from, type, data }){
   if (type === 'offer') {
     if (pc || incoming) return sig(from, 'busy');
-    incoming = { from, data };
-    pendingIce = []; peer = from; withVideo = !!data.video; localStream = null;
-    // রিং বাজার সময়েই সংযোগ প্রস্তুত করি, যাতে ধরার পর দ্রুত সংযুক্ত হয়
+    const video = !!data.video;
+    peer = from; withVideo = video; localStream = null; pendingIce = []; outIce = []; offerReady = false;
     setupPC();
-    incoming.ready = pc.setRemoteDescription(data.sdp).then(flushIce);
-    incoming.ready.catch(() => {});
+    const myPc = pc;
+    // রিং বাজা অবস্থাতেই offer সেট করে রাখা হয়, যাতে ধরার সাথে সাথে answer তৈরি করা যায়
+    const ready = myPc.setRemoteDescription(data.sdp).then(() => flushIce(myPc)).catch(() => {});
+    incoming = { from, data, ready, myPc };
+
+    // রিসিভারের প্রান্তেও আগে থেকে মিডিয়া অনুমতি নেওয়ার চেষ্টা (ইনকামিং রিংয়ের সময়)
+    mediaPromise = getMedia(video)
+      .then(s => { attachMedia(s, myPc); return s; })
+      .catch(() => null);
+
     $('#iav').textContent = initial(from);
     $('#iname').textContent = from;
-    $('#itype').textContent = data.video ? 'ভিডিও কল আসছে…' : 'ভয়েস কল আসছে…';
+    $('#itype').textContent = video ? 'ভিডিও কল আসছে…' : 'ভয়েস কল আসছে…';
     $('#incoming').classList.add('on');
     ring('in');
   } else if (type === 'answer') {
     if (pc && from === peer) {
-      try { await pc.setRemoteDescription(data); await flushIce(); }
-      catch { sig(from, 'hangup'); cleanup('কল সংযুক্ত করা যায়নি'); }
+      try {
+        await pc.setRemoteDescription(data);
+        await flushIce(pc);
+        flushOutIce();
+      } catch {
+        sig(from, 'hangup');
+        cleanup('কল সংযুক্ত করা যায়নি');
+      }
     }
   } else if (type === 'ice') {
+    const list = Array.isArray(data) ? data : [data];
     if (pc && from === peer) {
-      if (pc.remoteDescription) pc.addIceCandidate(data).catch(() => {}); else pendingIce.push(data);
-    } else if (incoming && from === incoming.from) pendingIce.push(data);
+      if (pc.remoteDescription && pc.remoteDescription.type) {
+        for (const c of list) pc.addIceCandidate(c).catch(() => {});
+      } else {
+        pendingIce.push(...list);
+      }
+    } else if (incoming && from === incoming.from) {
+      pendingIce.push(...list);
+    }
   } else if (type === 'reject') {
     if (from === peer) cleanup('কল প্রত্যাখ্যান করা হয়েছে');
   } else if (type === 'busy') {
@@ -365,53 +493,7 @@ async function onSignal({ from, type, data }){
   }
 }
 
-async function flushIce(){
-  for (const c of pendingIce) await pc.addIceCandidate(c).catch(() => {});
-  pendingIce = [];
-}
-
-/* ---------- রিসিভার ---------- */
-async function acceptCall(){
-  if (!incoming) return;
-  const { from, ready } = incoming;
-  const myPc = pc;
-  const video = withVideo;
-  stopRing();
-  incoming = null;
-  $('#incoming').classList.remove('on');
-  openCallUI('সংযুক্ত হচ্ছে…');
-  // মাইক/ক্যামেরা চালু আর উত্তর তৈরি একসঙ্গে চলে
-  getMedia(video).then(s => attachMedia(s, myPc)).catch(e => mediaFailed(e, myPc, video));
-  // ধরার পর ৩০ সেকেন্ডে সংযোগ না হলে ছেড়ে দিই, যেন আটকে না থাকে
-  ringTimeout = setTimeout(() => { if (pc === myPc && pc.connectionState !== 'connected') { sig(from, 'hangup'); cleanup('সংযোগ হয়নি, আবার চেষ্টা করুন'); } }, 30000);
-  try {
-    await ready;
-    if (pc !== myPc) return; // ইতিমধ্যে কেটে গেছে
-    pc.getTransceivers().forEach(t => { if (t.receiver.track) t.direction = 'sendrecv'; });
-    const ans = await pc.createAnswer();
-    await pc.setLocalDescription(ans);
-    await sig(from, 'answer', pc.localDescription);
-  } catch { if (pc === myPc) { sig(from, 'hangup'); cleanup('কল সংযুক্ত করা যায়নি'); } }
-}
-
-function rejectCall(){
-  if (incoming) sig(incoming.from, 'reject');
-  cleanup('');
-}
-
-function endCall(){
-  if (peer) sig(peer, 'hangup');
-  cleanup('');
-}
-
-function cleanup(msg){
-  stopRing(); clearInterval(timer); clearTimeout(ringTimeout); clearTimeout(discTimer); releaseAwake();
-  outIce = null; facing = 'user';
-  if (dc) { try { dc.close(); } catch {} }
-  if (pc) { pc.onconnectionstatechange = null; pc.close(); }
-  if (localStream) localStream.getTracks().forEach(t => t.stop());
-  pc = dc = localStream = peer = incoming = remoteStream = null; pendingIce = [];
-  $('#remote').srcObject = null; $('#local').srcObject = null;
-  $('#incoming').classList.remove('on');
-  show('home');
-  if (msg) { $('#st').textContent = msg; setTimeout(() => { $('#st').textContent = '● 
+async function flushIce(targetPc = pc){
+  if (!targetPc || !pendingIce.length) return;
+  const list = pendingIce.splice(0, pendingIce.length);
+  for 
