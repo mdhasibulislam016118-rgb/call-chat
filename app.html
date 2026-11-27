@@ -104,24 +104,58 @@ header small{opacity:.8}
 const $ = s => document.querySelector(s);
 
 let ICE = {
-  iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }],
-  iceCandidatePoolSize: 8,
+  iceServers: [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }
+  ],
+  iceCandidatePoolSize: 10,
   bundlePolicy: 'max-bundle',
   rtcpMuxPolicy: 'require'
 };
-fetch('/config').then(r => r.json()).then(c => {
-  if (c && c.iceServers) ICE = { ...ICE, ...c, iceCandidatePoolSize: 8 };
-}).catch(() => {});
+
+fetch('/config', { cache: 'no-store' })
+  .then(r => r.ok ? r.json() : null)
+  .then(c => {
+    if (c && Array.isArray(c.iceServers) && c.iceServers.length) {
+      ICE = { ...ICE, ...c, iceCandidatePoolSize: c.iceCandidatePoolSize ?? 10 };
+    }
+  })
+  .catch(() => {});
 
 let me = null, es = null, pc = null, dc = null, localStream = null;
 let peer = null, incoming = null, pendingIce = [], withVideo = false, timer = null, startedAt = 0;
 let onlineUsers = [], remoteStream = null, token = null, wakeLock = null;
-let offerReady = false, outIce = [], iceFlushTimer = null, sigQueue = Promise.resolve();
-let ringTimeout = null, discTimer = null, iceRestartTimer = null, retryTimer = null;
-let facing = 'user', wantOnline = false, mediaPromise = null;
+let signalingReady = false, outIce = [], iceFlushTimer = null, sigQueue = Promise.resolve();
+let ringTimeout = null, discTimer = null, iceRestarted = false, retryTimer = null, keepAliveTimer = null;
+let facing = 'user', wantOnline = false, mediaPromise = null, accepting = false;
 
 function show(id){ document.querySelectorAll('.screen').forEach(s => s.classList.toggle('on', s.id === id)); }
 const initial = n => (n || '?').trim().charAt(0);
+
+function tuneOpusSdp(sdp){
+  if (!sdp || !sdp.includes('a=rtpmap:')) return sdp;
+  const lines = sdp.split('\r\n');
+  const opusPayloads = [];
+  for (const l of lines) {
+    const m = l.match(/^a=rtpmap:(\d+)\s+opus\/48000/i);
+    if (m) opusPayloads.push(m[1]);
+  }
+  if (!opusPayloads.length) return sdp;
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    out.push(line);
+    for (const pt of opusPayloads) {
+      if (line.startsWith(`a=fmtp:${pt} `)) {
+        let updated = line;
+        if (!updated.includes('useinbandfec=1')) updated += ';useinbandfec=1';
+        if (!updated.includes('stereo=0')) updated += ';stereo=0';
+        if (!updated.includes('minptime=10')) updated += ';minptime=10';
+        out[out.length - 1] = updated;
+      }
+    }
+  }
+  return out.join('\r\n');
+}
 
 /* ---------- সংযোগ ---------- */
 function login(){
@@ -130,41 +164,67 @@ function login(){
   $('#err').textContent = '';
   initAudio();
   try { localStorage.setItem('callname', n); } catch {}
-  connect(n);
+  connect(n, false);
 }
 $('#name').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
 try { const s = localStorage.getItem('callname'); if (s) $('#name').value = s; } catch {}
 
+function startServerKeepAlive(){
+  clearInterval(keepAliveTimer);
+  keepAliveTimer = setInterval(() => {
+    if (!wantOnline) return;
+    fetch('/config', { cache: 'no-store' }).catch(() => {});
+  }, 240000);
+}
+
 function connect(name, isRetry){
   clearTimeout(retryTimer);
-  if (es) es.close();
+  if (es) { try { es.close(); } catch {} }
   wantOnline = true;
-  es = new EventSource('/events?user=' + encodeURIComponent(name));
+  startServerKeepAlive();
+  const nextEs = new EventSource('/events?user=' + encodeURIComponent(name));
+  es = nextEs;
   let ok = false;
-  es.addEventListener('hello', e => {
-    ok = true; me = name;
+
+  nextEs.addEventListener('hello', e => {
+    if (es !== nextEs) return;
+    ok = true;
+    me = name;
     try { token = JSON.parse(e.data).token; } catch { token = null; }
-    $('#me').textContent = name; $('#st').textContent = '● অনলাইন';
+    $('#me').textContent = name;
+    $('#st').textContent = '● অনলাইন';
     if (!$('#call').classList.contains('on')) show('home');
   });
-  es.addEventListener('users', e => { onlineUsers = JSON.parse(e.data); renderUsers(); checkPeerPresent(); });
-  es.addEventListener('signal', e => onSignal(JSON.parse(e.data)));
-  es.onerror = () => {
-    if (!ok) {
-      es.close();
-      if (isRetry) { $('#st').textContent = '○ পুনরায় সংযোগ হচ্ছে…'; retryTimer = setTimeout(() => connect(name, true), 1500); }
-      else $('#err').textContent = 'নামটি আগে থেকেই ব্যবহৃত, অথবা সার্ভারে সংযোগ হয়নি।';
+
+  nextEs.addEventListener('users', e => {
+    if (es !== nextEs) return;
+    try { onlineUsers = JSON.parse(e.data); } catch {}
+    renderUsers();
+    checkPeerPresent();
+  });
+
+  nextEs.addEventListener('signal', e => {
+    if (es !== nextEs) return;
+    try { onSignal(JSON.parse(e.data)); } catch {}
+  });
+
+  nextEs.onerror = () => {
+    if (es !== nextEs) return;
+    try { nextEs.close(); } catch {}
+    if (!ok && !isRetry) {
+      $('#err').textContent = 'নামটি আগে থেকেই ব্যবহৃত, অথবা সার্ভারে সংযোগ হয়নি।';
     } else {
       $('#st').textContent = '○ পুনরায় সংযোগ হচ্ছে…';
-      es.close();
-      retryTimer = setTimeout(() => connect(name, true), 1200);
+      retryTimer = setTimeout(() => { if (wantOnline) connect(name, true); }, 600);
     }
   };
 }
 
 function checkPeerPresent(){
   if (incoming && !onlineUsers.includes(incoming.from)) cleanup('মিসড কল');
-  else if (peer && pc && !['connected', 'completed'].includes(pc.connectionState) && !onlineUsers.includes(peer)) cleanup('ইউজার অফলাইন হয়ে গেছে');
+  else if (peer && pc && !['connected', 'completed'].includes(pc.connectionState) && !onlineUsers.includes(peer)) {
+    cleanup('ইউজার অফলাইন হয়ে গেছে');
+  }
 }
 
 function renderUsers(){
@@ -189,311 +249,5 @@ function renderUsers(){
   });
 }
 
-// সিরিয়াল সিগন্যাল কিউ: offer-এর আগে ice যাওয়া বা রিকোয়েস্ট জ্যাম হওয়া ঠেকায়
 function sig(to, type, data){
-  const task = async () => {
-    for (let i = 0; i < 3; i++) {
-      try {
-        const res = await fetch('/signal', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ from: me, token, to, type, data })
-        });
-        if (res.ok) return res;
-      } catch {}
-      await new Promise(r => setTimeout(r, 150 * (i + 1)));
-    }
-    return null;
-  };
-  const next = sigQueue.then(task, task);
-  sigQueue = next.catch(() => null);
-  return next;
-}
-
-// একাধিক ICE candidate একসাথে ব্যাচ করে পাঠায়, যাতে নেটওয়ার্ক ওভারহেড কমে এবং দ্রুত পৌঁছায়
-function queueIce(to, cand){
-  if (!cand) return;
-  outIce.push(cand);
-  if (!offerReady) return;
-  clearTimeout(iceFlushTimer);
-  iceFlushTimer = setTimeout(flushOutIce, 25);
-}
-
-function flushOutIce(){
-  clearTimeout(iceFlushTimer);
-  iceFlushTimer = null;
-  if (!offerReady || !outIce.length || !peer) return;
-  const batch = outIce.splice(0, outIce.length);
-  sig(peer, 'ice', batch.length === 1 ? batch[0] : batch);
-}
-
-function ensureConnected(){
-  if (wantOnline && me && (!es || es.readyState === 2)) connect(me, true);
-}
-window.addEventListener('online', ensureConnected);
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) { ensureConnected(); if (pc) keepAwake(); }
-});
-
-async function keepAwake(){
-  try {
-    if ('wakeLock' in navigator && !wakeLock) {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', () => { wakeLock = null; });
-    }
-  } catch {}
-}
-function releaseAwake(){ try { if (wakeLock) wakeLock.release(); } catch {} wakeLock = null; }
-
-/* ---------- রিংটোন ---------- */
-let actx = null, ringT = null;
-function initAudio(){ try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); } catch {} }
-function beep(freq, dur){
-  if (!actx) return;
-  const o = actx.createOscillator(), g = actx.createGain();
-  o.frequency.value = freq; g.gain.value = 0.12;
-  o.connect(g); g.connect(actx.destination); o.start(); o.stop(actx.currentTime + dur);
-}
-function ring(kind){
-  stopRing();
-  const play = () => {
-    if (kind === 'in') {
-      beep(880, .25);
-      setTimeout(() => beep(660, .25), 300);
-      if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
-    } else beep(440, .5);
-  };
-  play();
-  ringT = setInterval(play, kind === 'in' ? 1600 : 2400);
-}
-function stopRing(){ clearInterval(ringT); ringT = null; if (navigator.vibrate) navigator.vibrate(0); }
-
-/* ---------- মিডিয়া ও কল শুরু (কলার) ---------- */
-function getMedia(video){
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('insecure'));
-  return navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    video: video ? { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24, max: 30 } } : false
-  });
-}
-
-function mediaError(e, video){
-  if (e && e.message === 'insecure') return 'মাইক/ক্যামেরা চালাতে পেজটি HTTPS (বা localhost) এ খুলতে হবে।';
-  return 'মাইক্রোফোন' + (video ? '/ক্যামেরা' : '') + ' ব্যবহারের অনুমতি দিন।';
-}
-
-function attachMedia(stream, myPc){
-  if (!myPc || pc !== myPc || myPc.signalingState === 'closed') {
-    stream.getTracks().forEach(t => t.stop());
-    return;
-  }
-  localStream = stream;
-  for (const t of stream.getTracks()) {
-    const tr = myPc.getTransceivers().find(x => x.receiver.track && x.receiver.track.kind === t.kind);
-    if (tr) {
-      tr.direction = 'sendrecv';
-      tr.sender.replaceTrack(t).catch(() => {});
-    } else {
-      myPc.addTrack(t, stream);
-    }
-  }
-  $('#local').srcObject = stream;
-}
-
-function mediaFailed(e, myPc, video){
-  if (!myPc || pc !== myPc) return;
-  if (peer) sig(peer, 'hangup');
-  cleanup('');
-  alert(mediaError(e, video));
-}
-
-async function startCall(to, video){
-  if (pc || incoming) return;
-  initAudio();
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    alert(mediaError(new Error('insecure'), video));
-    return;
-  }
-  peer = to; withVideo = video; localStream = null; offerReady = false; outIce = [];
-  openCallUI('রিং হচ্ছে…');
-  ring('out');
-  setupPC();
-  const myPc = pc;
-
-  myPc.addTransceiver('audio', { direction: 'sendrecv' });
-  if (video) myPc.addTransceiver('video', { direction: 'sendrecv' });
-  dc = myPc.createDataChannel('chat', { ordered: true });
-  setupDC();
-
-  mediaPromise = getMedia(video)
-    .then(s => { attachMedia(s, myPc); return s; })
-    .catch(e => { mediaFailed(e, myPc, video); return null; });
-
-  try {
-    const offer = await myPc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: video });
-    if (pc !== myPc) return;
-    await myPc.setLocalDescription(offer);
-    const r = await sig(to, 'offer', { sdp: myPc.localDescription, video });
-    if (!r || !r.ok) throw new Error('offline');
-    if (pc !== myPc) return;
-    offerReady = true;
-    flushOutIce();
-  } catch {
-    if (pc === myPc) return cleanup('ইউজার এখন অনলাইনে নেই');
-  }
-
-  ringTimeout = setTimeout(() => {
-    if (pc === myPc && !['connected', 'completed'].includes(myPc.connectionState)) {
-      sig(peer, 'hangup');
-      cleanup('কেউ ধরেনি');
-    }
-  }, 45000);
-}
-
-function setupPC(){
-  pc = new RTCPeerConnection(ICE);
-  const myPc = pc;
-  remoteStream = new MediaStream();
-  $('#remote').srcObject = remoteStream;
-
-  pc.onicecandidate = e => {
-    if (pc !== myPc) return;
-    if (e.candidate) queueIce(peer, e.candidate);
-    else flushOutIce();
-  };
-
-  pc.ontrack = e => {
-    if (pc !== myPc) return;
-    remoteStream.addTrack(e.track);
-    $('#remote').play().catch(() => {});
-  };
-
-  pc.ondatachannel = e => {
-    if (pc !== myPc) return;
-    dc = e.channel;
-    setupDC();
-  };
-
-  pc.onconnectionstatechange = () => {
-    if (pc !== myPc) return;
-    const s = myPc.connectionState;
-    clearTimeout(discTimer);
-    if (s === 'connected' || s === 'completed') {
-      clearTimeout(ringTimeout);
-      clearTimeout(iceRestartTimer);
-      stopRing();
-      startTimer();
-      keepAwake();
-      $('#remote').play().catch(() => {});
-      if (withVideo) $('#info').style.display = 'none';
-    } else if (s === 'disconnected') {
-      $('#cstat').textContent = 'সংযোগ পুনঃস্থাপন হচ্ছে…';
-      if (typeof myPc.restartIce === 'function') {
-        try { myPc.restartIce(); } catch {}
-      }
-      discTimer = setTimeout(() => {
-        if (pc === myPc && pc.connectionState === 'disconnected') cleanup('সংযোগ বিচ্ছিন্ন হয়েছে');
-      }, 8000);
-    } else if (s === 'failed') {
-      cleanup('সংযোগ বিচ্ছিন্ন হয়েছে');
-    }
-  };
-}
-
-function setupDC(){
-  if (!dc) return;
-  dc.onmessage = e => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg && msg.type === 'chat') appendMsg(msg.text, false);
-    } catch {
-      appendMsg(String(e.data), false);
-    }
-  };
-}
-
-function openCallUI(status){
-  $('#cav').textContent = initial(peer);
-  $('#cname').textContent = peer;
-  $('#cstat').textContent = status;
-  $('#info').style.display = '';
-  $('#msgs').innerHTML = '';
-  $('#chat').classList.remove('on');
-  const lv = $('#local');
-  lv.style.display = withVideo ? '' : 'none';
-  lv.srcObject = localStream;
-  $('#remote').style.visibility = withVideo ? 'visible' : 'hidden';
-  $('#bCam').style.display = withVideo ? '' : 'none';
-  $('#bFlip').style.display = withVideo ? '' : 'none';
-  $('#local').style.transform = facing === 'user' ? 'scaleX(-1)' : 'none';
-  $('#bMute').classList.remove('off'); $('#bMute').textContent = '🎤';
-  $('#bCam').classList.remove('off'); $('#bCam').textContent = '📷';
-  show('call');
-}
-
-function startTimer(){
-  startedAt = Date.now(); clearInterval(timer);
-  timer = setInterval(() => {
-    const s = Math.floor((Date.now() - startedAt) / 1000);
-    $('#cstat').textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
-  }, 1000);
-}
-
-/* ---------- সিগন্যাল গ্রহণ ---------- */
-async function onSignal({ from, type, data }){
-  if (type === 'offer') {
-    if (pc || incoming) return sig(from, 'busy');
-    const video = !!data.video;
-    peer = from; withVideo = video; localStream = null; pendingIce = []; outIce = []; offerReady = false;
-    setupPC();
-    const myPc = pc;
-    // রিং বাজা অবস্থাতেই offer সেট করে রাখা হয়, যাতে ধরার সাথে সাথে answer তৈরি করা যায়
-    const ready = myPc.setRemoteDescription(data.sdp).then(() => flushIce(myPc)).catch(() => {});
-    incoming = { from, data, ready, myPc };
-
-    // রিসিভারের প্রান্তেও আগে থেকে মিডিয়া অনুমতি নেওয়ার চেষ্টা (ইনকামিং রিংয়ের সময়)
-    mediaPromise = getMedia(video)
-      .then(s => { attachMedia(s, myPc); return s; })
-      .catch(() => null);
-
-    $('#iav').textContent = initial(from);
-    $('#iname').textContent = from;
-    $('#itype').textContent = video ? 'ভিডিও কল আসছে…' : 'ভয়েস কল আসছে…';
-    $('#incoming').classList.add('on');
-    ring('in');
-  } else if (type === 'answer') {
-    if (pc && from === peer) {
-      try {
-        await pc.setRemoteDescription(data);
-        await flushIce(pc);
-        flushOutIce();
-      } catch {
-        sig(from, 'hangup');
-        cleanup('কল সংযুক্ত করা যায়নি');
-      }
-    }
-  } else if (type === 'ice') {
-    const list = Array.isArray(data) ? data : [data];
-    if (pc && from === peer) {
-      if (pc.remoteDescription && pc.remoteDescription.type) {
-        for (const c of list) pc.addIceCandidate(c).catch(() => {});
-      } else {
-        pendingIce.push(...list);
-      }
-    } else if (incoming && from === incoming.from) {
-      pendingIce.push(...list);
-    }
-  } else if (type === 'reject') {
-    if (from === peer) cleanup('কল প্রত্যাখ্যান করা হয়েছে');
-  } else if (type === 'busy') {
-    if (from === peer) cleanup('ইউজার অন্য কলে ব্যস্ত');
-  } else if (type === 'hangup') {
-    if (incoming && from === incoming.from) cleanup('মিসড কল');
-    else if (from === peer) cleanup('কল শেষ হয়েছে');
-  }
-}
-
-async function flushIce(targetPc = pc){
-  if (!targetPc || !pendingIce.length) return;
-  const list = pendingIce.splice(0, pendingIce.length);
-  for 
+  if (!me
