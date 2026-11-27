@@ -250,4 +250,278 @@ function renderUsers(){
 }
 
 function sig(to, type, data){
-  if (!me
+  if (!me || !to) return Promise.resolve(null);
+  const task = async () => {
+    for (let i = 0; i < 3; i++) {
+      try {
+        const res = await fetch('/signal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: me, token, to, type, data })
+        });
+        if (res.ok) return res;
+      } catch {}
+      await new Promise(r => setTimeout(r, 90 * (i + 1)));
+    }
+    return null;
+  };
+  const next = sigQueue.then(task, task);
+  sigQueue = next.catch(() => null);
+  return next;
+}
+
+function queueIce(to, cand){
+  if (!cand || !to) return;
+  const plain = typeof cand.toJSON === 'function' ? cand.toJSON() : cand;
+  outIce.push(plain);
+  if (!signalingReady) return;
+  clearTimeout(iceFlushTimer);
+  iceFlushTimer = setTimeout(flushOutIce, 15);
+}
+
+function flushOutIce(){
+  clearTimeout(iceFlushTimer);
+  iceFlushTimer = null;
+  if (!signalingReady || !outIce.length || !peer) return;
+  const batch = outIce.splice(0, outIce.length);
+  sig(peer, 'ice', batch.length === 1 ? batch[0] : batch);
+}
+
+function ensureConnected(){
+  if (wantOnline && me && (!es || es.readyState === 2)) connect(me, true);
+}
+window.addEventListener('online', ensureConnected);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    ensureConnected();
+    if (pc) keepAwake();
+    if ($('#remote').srcObject) $('#remote').play().catch(() => {});
+  }
+});
+
+async function keepAwake(){
+  try {
+    if ('wakeLock' in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  } catch {}
+}
+function releaseAwake(){ try { if (wakeLock) wakeLock.release(); } catch {} wakeLock = null; }
+
+/* ---------- রিংটোন ---------- */
+let actx = null, ringT = null;
+function initAudio(){
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+  } catch {}
+}
+function beep(freq, dur){
+  if (!actx) return;
+  try {
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.frequency.value = freq; g.gain.value = 0.12;
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch {}
+}
+function ring(kind){
+  stopRing();
+  const play = () => {
+    if (kind === 'in') {
+      beep(880, .22);
+      setTimeout(() => beep(660, .22), 260);
+      if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
+    } else beep(440, .45);
+  };
+  play();
+  ringT = setInterval(play, kind === 'in' ? 1500 : 2200);
+}
+function stopRing(){ clearInterval(ringT); ringT = null; if (navigator.vibrate) navigator.vibrate(0); }
+
+/* ---------- মিডিয়া ও কল শুরু (কলার) ---------- */
+function getMedia(video){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('insecure'));
+  return navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    video: video ? { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24, max: 30 } } : false
+  });
+}
+
+function mediaError(e, video){
+  if (e && e.message === 'insecure') return 'মাইক/ক্যামেরা চালাতে পেজটি HTTPS (বা localhost) এ খুলতে হবে।';
+  return 'মাইক্রোফোন' + (video ? '/ক্যামেরা' : '') + ' ব্যবহারের অনুমতি দিন।';
+}
+
+function attachMedia(stream, myPc){
+  if (!stream) return;
+  if (!myPc || pc !== myPc || myPc.signalingState === 'closed') {
+    stream.getTracks().forEach(t => t.stop());
+    return;
+  }
+  localStream = stream;
+  for (const t of stream.getTracks()) {
+    const tr = myPc.getTransceivers().find(x => x.receiver.track && x.receiver.track.kind === t.kind);
+    if (tr) {
+      tr.direction = 'sendrecv';
+      tr.sender.replaceTrack(t).catch(() => {});
+    } else {
+      myPc.addTrack(t, stream);
+    }
+  }
+  $('#local').srcObject = stream;
+}
+
+function mediaFailed(e, myPc, video){
+  if (!myPc || pc !== myPc) return;
+  if (peer) sig(peer, 'hangup');
+  cleanup('');
+  alert(mediaError(e, video));
+}
+
+async function startCall(to, video){
+  if (pc || incoming) return;
+  initAudio();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert(mediaError(new Error('insecure'), video));
+    return;
+  }
+  peer = to; withVideo = video; localStream = null; signalingReady = false; outIce = []; iceRestarted = false;
+  openCallUI('রিং হচ্ছে…');
+  ring('out');
+  setupPC();
+  const myPc = pc;
+
+  myPc.addTransceiver('audio', { direction: 'sendrecv' });
+  if (video) myPc.addTransceiver('video', { direction: 'sendrecv' });
+  dc = myPc.createDataChannel('chat', { ordered: true });
+  setupDC();
+
+  mediaPromise = getMedia(video)
+    .then(s => { attachMedia(s, myPc); return s; })
+    .catch(e => { mediaFailed(e, myPc, video); return null; });
+
+  try {
+    const offer = await myPc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: video });
+    if (pc !== myPc) return;
+    offer.sdp = tuneOpusSdp(offer.sdp);
+    await myPc.setLocalDescription(offer);
+    const r = await sig(to, 'offer', { sdp: myPc.localDescription, video });
+    if (!r || !r.ok) throw new Error('offline');
+    if (pc !== myPc) return;
+    signalingReady = true;
+    flushOutIce();
+  } catch {
+    if (pc === myPc) return cleanup('ইউজার এখন অনলাইনে নেই');
+  }
+
+  ringTimeout = setTimeout(() => {
+    if (pc === myPc && !['connected', 'completed'].includes(myPc.connectionState)) {
+      sig(peer, 'hangup');
+      cleanup('কেউ ধরেনি');
+    }
+  }, 45000);
+}
+
+function setupPC(){
+  pc = new RTCPeerConnection(ICE);
+  const myPc = pc;
+  remoteStream = new MediaStream();
+  $('#remote').srcObject = remoteStream;
+
+  pc.onicecandidate = e => {
+    if (pc !== myPc) return;
+    if (e.candidate) queueIce(peer, e.candidate);
+    else flushOutIce();
+  };
+
+  pc.ontrack = e => {
+    if (pc !== myPc) return;
+    if (e.streams && e.streams[0]) {
+      $('#remote').srcObject = e.streams[0];
+    } else {
+      remoteStream.addTrack(e.track);
+      $('#remote').srcObject = remoteStream;
+    }
+    $('#remote').play().catch(() => {});
+  };
+
+  pc.ondatachannel = e => {
+    if (pc !== myPc) return;
+    dc = e.channel;
+    setupDC();
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc !== myPc) return;
+    const s = myPc.connectionState;
+    clearTimeout(discTimer);
+    if (s === 'connected' || s === 'completed') {
+      clearTimeout(ringTimeout);
+      stopRing();
+      startTimer();
+      keepAwake();
+      $('#remote').play().catch(() => {});
+      if (withVideo) $('#info').style.display = 'none';
+    } else if (s === 'disconnected') {
+      $('#cstat').textContent = 'সংযোগ পুনঃস্থাপন হচ্ছে…';
+      if (!iceRestarted && typeof myPc.restartIce === 'function') {
+        iceRestarted = true;
+        try { myPc.restartIce(); } catch {}
+      }
+      discTimer = setTimeout(() => {
+        if (pc === myPc && pc.connectionState === 'disconnected') cleanup('সংযোগ বিচ্ছিন্ন হয়েছে');
+      }, 10000);
+    } else if (s === 'failed') {
+      cleanup('সংযোগ বিচ্ছিন্ন হয়েছে');
+    }
+  };
+}
+
+function setupDC(){
+  if (!dc) return;
+  dc.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg && msg.type === 'chat') appendMsg(msg.text, false);
+    } catch {
+      appendMsg(String(e.data), false);
+    }
+  };
+}
+
+function openCallUI(status){
+  $('#cav').textContent = initial(peer);
+  $('#cname').textContent = peer;
+  $('#cstat').textContent = status;
+  $('#info').style.display = '';
+  $('#msgs').innerHTML = '';
+  $('#chat').classList.remove('on');
+  const lv = $('#local');
+  lv.style.display = withVideo ? '' : 'none';
+  lv.srcObject = localStream;
+  $('#remote').style.visibility = withVideo ? 'visible' : 'hidden';
+  $('#bCam').style.display = withVideo ? '' : 'none';
+  $('#bFlip').style.display = withVideo ? '' : 'none';
+  $('#local').style.transform = facing === 'user' ? 'scaleX(-1)' : 'none';
+  $('#bMute').classList.remove('off'); $('#bMute').textContent = '🎤';
+  $('#bCam').classList.remove('off'); $('#bCam').textContent = '📷';
+  show('call');
+}
+
+function startTimer(){
+  startedAt = Date.now(); clearInterval(timer);
+  timer = setInterval(() => {
+    const s = Math.floor((Date.now() - startedAt) / 1000);
+    $('#cstat').textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }, 1000);
+}
+
+/* ---------- সিগন্যাল গ্রহণ ও কল রিসিভ ---------- */
+async function onSignal({ from, type, data }){
+  if (type === 'offer') {
+    if (pc || incoming) return sig(from, 'busy');
+    const video = !!(data && data.video);
+    const sdp = data && data.sdp ? data.sdp : data;
+    peer = from; withVideo 
