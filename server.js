@@ -9,14 +9,15 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT) || 3000;
-const MAX_CLIENTS = 500;          // একসঙ্গে সর্বোচ্চ অনলাইন ইউজার
-const MAX_PER_IP = 20;            // এক IP থেকে সর্বোচ্চ সংযোগ
-const MAX_SIGNALS_PER_MIN = 600;  // এক ইউজারের মিনিটে সর্বোচ্চ সিগন্যাল
-const MAX_BODY_BYTES = 120 * 1024;
-const RECONNECT_GRACE_MS = 2500;  // সাময়িক ডিসকানেক্টে ইউজার লিস্ট স্থিতিশীল রাখা
+const MAX_CLIENTS = 1000;          // একসঙ্গে সর্বোচ্চ অনলাইন ইউজার
+const MAX_PER_IP = 30;            // এক IP থেকে সর্বোচ্চ সংযোগ
+const MAX_SIGNALS_PER_MIN = 1200; // এক ইউজারের মিনিটে সর্বোচ্চ সিগন্যাল
+const MAX_BODY_BYTES = 160 * 1024;
+const RECONNECT_GRACE_MS = 1200;  // দ্রুত রিকানেক্ট ও স্টেল ইউজার দ্রুত ক্লিয়ার করার জন্য
+const HEARTBEAT_MS = 8000;        // প্রক্সি/মোবাইল সংযোগ সচল রাখার হার্টবিট
 const TYPES = new Set(['offer', 'answer', 'ice', 'hangup', 'reject', 'busy']);
 
-// ইউজারনেম -> { res, token, ip, count, hb, dropTimer }
+// ইউজারনেম -> { res, token, ip, count, hb, dropTimer, connectedAt }
 const clients = new Map();
 const ipCount = new Map();
 
@@ -28,21 +29,32 @@ const cleanName = (s) =>
 
 function iceConfig() {
   const iceServers = [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+        'stun:stun3.l.google.com:19302',
+      ],
+    },
   ];
+
   if (process.env.TURN_URL) {
-    const urls = process.env.TURN_URL.split(',').map((s) => s.trim()).filter(Boolean);
+    const urls = process.env.TURN_URL
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
     if (urls.length) {
-      iceServers.push({
-        urls,
-        username: process.env.TURN_USER || '',
-        credential: process.env.TURN_PASS || '',
-      });
+      const turnEntry = { urls };
+      if (process.env.TURN_USER) turnEntry.username = process.env.TURN_USER;
+      if (process.env.TURN_PASS) turnEntry.credential = process.env.TURN_PASS;
+      iceServers.push(turnEntry);
     }
   }
+
   return {
     iceServers,
-    iceCandidatePoolSize: 8,
+    iceCandidatePoolSize: 10,
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
   };
@@ -57,11 +69,11 @@ const MANIFEST = JSON.stringify({
   scope: '/',
   display: 'standalone',
   background_color: '#0b141a',
-  theme_color: '#0f766e',
+  theme_color: '#075e54',
   icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }],
 });
 
-const ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#0f766e"/><path d="M22 18c-2 0-4 2-4 5 0 13 14 27 27 27 3 0 5-2 5-4l-1-5-8-3-4 4c-4-2-8-6-10-10l4-4-3-8z" fill="#fff"/></svg>`;
+const ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#075e54"/><path d="M22 18c-2 0-4 2-4 5 0 13 14 27 27 27 3 0 5-2 5-4l-1-5-8-3-4 4c-4-2-8-6-10-10l4-4-3-8z" fill="#fff"/></svg>`;
 
 const PAGES = {
   '/': 'index.html',
@@ -75,13 +87,15 @@ const CSP = [
   "script-src 'self' 'unsafe-inline'",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "font-src https://fonts.gstatic.com",
-  "img-src 'self' data:",
+  "img-src 'self' data: blob:",
   "media-src 'self' blob:",
-  "connect-src 'self'",
+  "connect-src 'self' stun: turn: turns:",
   "frame-ancestors 'none'",
   "base-uri 'none'",
   "form-action 'self'",
 ].join('; ');
+
+let broadcastTimer = null;
 
 function safeWrite(res, text) {
   if (!res || res.writableEnded || res.destroyed) return false;
@@ -98,21 +112,39 @@ function send(res, event, data) {
   return safeWrite(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function broadcastUsers() {
+function broadcastUsersNow() {
+  broadcastTimer = null;
   const list = [...clients.keys()];
   const payload = `event: users\ndata: ${JSON.stringify(list)}\n\n`;
-  for (const c of clients.values()) {
-    safeWrite(c.res, payload);
+  for (const [user, c] of clients.entries()) {
+    if (!safeWrite(c.res, payload)) {
+      scheduleDropClient(user, c);
+    }
   }
+}
+
+function broadcastUsers(immediate = false) {
+  if (immediate) {
+    if (broadcastTimer) {
+      clearTimeout(broadcastTimer);
+      broadcastTimer = null;
+    }
+    broadcastUsersNow();
+    return;
+  }
+  if (broadcastTimer) return;
+  broadcastTimer = setTimeout(broadcastUsersNow, 30);
+  broadcastTimer.unref?.();
 }
 
 function clientIp(req) {
   const xf = req.headers['x-forwarded-for'];
   if (xf) return String(xf).split(',')[0].trim();
-  return req.socket.remoteAddress || 'unknown';
+  return req.socket?.remoteAddress || 'unknown';
 }
 
 function releaseClientEntry(user, c, notify = true) {
+  if (!c) return;
   if (c.hb) {
     clearInterval(c.hb);
     c.hb = null;
@@ -121,22 +153,26 @@ function releaseClientEntry(user, c, notify = true) {
     clearTimeout(c.dropTimer);
     c.dropTimer = null;
   }
+  try {
+    if (!c.res.writableEnded && !c.res.destroyed) c.res.end();
+  } catch {}
+
   if (clients.get(user) === c) {
     clients.delete(user);
     const n = (ipCount.get(c.ip) || 1) - 1;
     if (n <= 0) ipCount.delete(c.ip);
     else ipCount.set(c.ip, n);
-    if (notify) broadcastUsers();
+    if (notify) broadcastUsers(true);
   }
 }
 
 function scheduleDropClient(user, c) {
-  if (clients.get(user) !== c) return;
+  if (!c || clients.get(user) !== c) return;
   if (c.hb) {
     clearInterval(c.hb);
     c.hb = null;
   }
-  if (c.dropTimer) clearTimeout(c.dropTimer);
+  if (c.dropTimer) return;
   c.dropTimer = setTimeout(() => {
     releaseClientEntry(user, c, true);
   }, RECONNECT_GRACE_MS);
@@ -149,20 +185,21 @@ setInterval(() => {
 }, 60000).unref();
 
 const server = http.createServer((req, res) => {
+  req.socket?.setNoDelay?.(true);
   res.on('error', () => {});
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
   if (req.headers['x-forwarded-proto'] === 'https') {
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
 
   let url;
   try {
-    url = new URL(req.url, 'http://localhost');
+    url = new URL(req.url || '/', 'http://localhost');
   } catch {
-    res.writeHead(400);
-    return res.end();
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('bad url');
   }
 
   // ক্লায়েন্ট সংযোগ (Server-Sent Events)
@@ -175,8 +212,12 @@ const server = http.createServer((req, res) => {
 
     const existing = clients.get(user);
     if (existing) {
-      // আগের সংযোগটি গ্রেস পিরিয়ডে থাকলে বা মৃত হলে পরিষ্কার করে নতুন সংযোগ নিই
-      if (existing.dropTimer || existing.res.writableEnded || existing.res.destroyed) {
+      const isStale =
+        existing.dropTimer ||
+        existing.res.writableEnded ||
+        existing.res.destroyed ||
+        Date.now() - existing.connectedAt > 4000;
+      if (isStale) {
         releaseClientEntry(user, existing, false);
       } else {
         res.writeHead(409, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -201,23 +242,33 @@ const server = http.createServer((req, res) => {
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
+    res.socket?.setNoDelay?.(true);
 
     const token = crypto.randomBytes(16).toString('hex');
-    const c = { res, token, ip, count: 0, hb: null, dropTimer: null };
+    const c = {
+      res,
+      token,
+      ip,
+      count: 0,
+      hb: null,
+      dropTimer: null,
+      connectedAt: Date.now(),
+    };
     clients.set(user, c);
     ipCount.set(ip, (ipCount.get(ip) || 0) + 1);
 
     send(res, 'hello', { user, token });
-    broadcastUsers();
+    broadcastUsers(true);
 
     c.hb = setInterval(() => {
       if (!safeWrite(res, ':hb\n\n')) {
         scheduleDropClient(user, c);
       }
-    }, 12000);
+    }, HEARTBEAT_MS);
     c.hb.unref?.();
 
     req.on('close', () => scheduleDropClient(user, c));
+    res.on('close', () => scheduleDropClient(user, c));
     return;
   }
 
@@ -245,9 +296,13 @@ const server = http.createServer((req, res) => {
       try {
         const raw = Buffer.concat(chunks).toString('utf8');
         const parsed = JSON.parse(raw);
-        const { from, to, type, data, token } = parsed || {};
+        const from = cleanName(parsed?.from);
+        const to = cleanName(parsed?.to);
+        const type = parsed?.type;
+        const data = parsed?.data;
+        const token = parsed?.token;
 
-        if (typeof from !== 'string' || typeof to !== 'string' || !TYPES.has(type)) {
+        if (!from || !to || typeof type !== 'string' || !TYPES.has(type)) {
           res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
           return res.end('bad request');
         }
@@ -281,7 +336,10 @@ const server = http.createServer((req, res) => {
           return res.end('offline');
         }
 
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.writeHead(200, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-store',
+        });
         res.end('ok');
       } catch {
         res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -360,15 +418,13 @@ process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e))
 
 // নতুন ভার্সন ডিপ্লয়ের সময় ভদ্রভাবে বন্ধ হই (ক্লায়েন্ট নিজে আবার সংযুক্ত হবে)
 function shutdown() {
+  if (broadcastTimer) clearTimeout(broadcastTimer);
   for (const [user, c] of clients.entries()) {
-    if (c.hb) clearInterval(c.hb);
-    if (c.dropTimer) clearTimeout(c.dropTimer);
-    try { c.res.end(); } catch {}
-    clients.delete(user);
+    releaseClientEntry(user, c, false);
   }
   ipCount.clear();
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 3000).unref();
+  setTimeout(() => process.exit(0), 2000).unref();
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
